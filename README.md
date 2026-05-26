@@ -1,4 +1,4 @@
-# Embedded-Digital-Synthesizer-on-PIC18F46K22
+# Embedded Digital Synthesizer on PIC18F46K22
 
 ## Overview
 
@@ -68,17 +68,14 @@ The main design challenge was generating audio at a fixed sample rate while also
 
 The synth DDS uses the upper 8 bits of a 32-bit phase accumulator as a dynamic index that moves through a 256-sample wavetable. This allows for pitch to be controlled by changing the phase increment instead of the timer period and for easy calculation of samples for square, sawtooth, and triangle waves.
 
-ADC reading with potentiometers on noisy breadboards sometimes did not deliver the full range from 0 to 1023, so the ADC values were calibrated and converted into different forms like percentages for volume and tremolo or millisecond values for the attack, decay, and release parameters. The LCD menu screens allow for two potentiometers to control different pairs of sound settings and allow for modular expansion with more parameters. The menu edit functionality is necessary so that sound parameter values are not automatically updated upon switching menu screens. 
+ADC readings from the potentiometers did not always span the full 0–1023 range on the breadboard, so the firmware calibrates the measured range and maps it into user-facing values such as percentages for volume/tremolo and milliseconds for ADSR timing. The LCD menu screens allow for two potentiometers to control different pairs of sound settings and allow for modular expansion with more parameters. The menu edit functionality is necessary so that sound parameter values are not automatically updated upon switching menu screens. 
 
-User-interface tasks are handled separately in the main loop using a slower Timer0-based control tick. This includes ADC reads, LCD menu updates, button debouncing, and parameter editing. Sound parameters are stored in a structured note profile, which made it easier to organize volume, waveform, pitch, envelope, and tremolo settings. UI and audio parameters were separated into different note profiles to make code easier to manage and behave more predictably. 
+User-interface tasks are handled separately in the main loop using a slower Timer0-based control tick. This includes ADC reads, LCD menu updates, button debouncing, and parameter editing. Sound parameters are stored in a structured note profile, which made it easier to organize volume, waveform, pitch, envelope, and tremolo settings. UI parameters and audio parameters were separated so the LCD/ADC control logic could update settings without the audio ISR reading partially modified values.
 
-Several design decisions were made to fit the constraints of the PIC18F46K22. The audio path uses integer arithmetic instead of floating-point math, the LCD is updated only when needed, and button inputs are debounced using counters rather than blocking delays that burden the CPU. These choices helped keep the audio interrupt predictable while still allowing real-time control of the synth.
+Several design decisions were made to fit the constraints of the PIC18F46K22. The audio path uses integer arithmetic instead of floating-point math, the LCD is updated only when needed, and button inputs are debounced using counters rather than blocking delays. These choices helped keep the audio interrupt predictable while still allowing real-time control of the synth.
 
 ## Testing and Verification
 The synthesizer was tested and documented incrementally by verifying various hardware and firmware subsystems before integrating everything together, reducing debugging headache and providing isolated code samples that are more easily understood. Testing began with basic DAC communication, then progressed through audio waveform generation, timer-driven sampling, DDS pitch control, envelope shaping, tremolo, LCD/ADC input, button debouncing, and final system integration.
-## Testing and Verification
-
-The synth was tested incrementally, starting with low-level hardware bring-up and ending with full system integration. Each stage verified one subsystem before it was merged into the final firmware.
 
 | Stage | Test / Milestone | What Was Verified |
 |---|---|---|

@@ -18,3 +18,11 @@ The system supports multiple waveforms, chromatic pitch selection, volume contro
 - Tremolo modulation using a low-frequency oscillator
 - Structured note profile system for sound parameters
 - EEPROM preset save/load for persistent settings
+
+## System Architecture
+
+The synthesizer separates real-time audio generation from slower user-interface tasks.
+
+The Timer2 interrupt runs at the audio sample rate. Each interrupt updates the DDS phase accumulator, selects the current waveform sample, applies envelope and tremolo scaling, and sends the final sample to the MCP4822 DAC over SPI.
+
+The main loop handles slower tasks such as reading potentiometers, updating the LCD menu, debouncing buttons, and applying changes to the current note profile. This separation prevents slow UI operations from interfering with the real-time audio output.

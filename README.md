@@ -26,6 +26,8 @@ The synthesizer separates real-time audio generation from slower user-interface 
 The Timer2 interrupt runs at the audio sample rate. Each interrupt updates the DDS phase accumulator, selects the current waveform sample, applies envelope and tremolo scaling, and sends the final sample to the MCP4822 DAC over SPI.
 
 The main loop handles slower tasks such as reading potentiometers, updating the LCD menu, debouncing buttons, and applying changes to the current note profile. This separation prevents slow UI operations from interfering with the real-time audio output.
+<img width="1767" height="543" alt="image" src="https://github.com/user-attachments/assets/c554bf3b-c97d-4ea9-a29e-9ab64f7a7de4" />
+
 
 ## Hardware
 

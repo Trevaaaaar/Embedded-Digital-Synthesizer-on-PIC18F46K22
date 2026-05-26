@@ -37,3 +37,27 @@ The main loop handles slower tasks such as reading potentiometers, updating the 
 | Potentiometers | Analog parameter control |
 | Push buttons | Note trigger and menu navigation |
 | Audio jack / amplifier | Audio output |
+
+## Timing and Performance
+| Parameter | Value |
+|---|---|
+| MCU clock | 64 MHz |
+| Audio sample rate | 10 kHz |
+| Audio timer | Timer2, 100 us tick |
+| Control/debounce timer | Timer0, 1 ms tick |
+| DAC resolution | 12-bit |
+| DDS accumulator | 32-bit |
+| Wavetable size | 256 samples |
+| Pitch range | C4 to C5 chromatic octave |
+
+## User Interface
+
+The LCD menu is divided into parameter screens. Two potentiometers adjust the active parameters depending on the selected screen.
+
+| Screen | Pot 1 | Pot 2 |
+|---|---|---|
+| 0 | Volume | Waveform |
+| 1 | Attack | Decay |
+| 2 | Sustain | Release |
+| 3 | Tremolo depth | Pitch |
+| 4 | Preset No. | Load/Save |

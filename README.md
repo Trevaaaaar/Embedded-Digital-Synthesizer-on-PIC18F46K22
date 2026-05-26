@@ -13,7 +13,7 @@ The system supports multiple waveforms, chromatic pitch selection, volume contro
 - 256-sample sine wavetable with additional square, sawtooth, and triangle waveforms
 - MCP4822 12-bit DAC controlled over SPI
 - ADC-based control of volume, waveform, envelope, tremolo, and pitch
-- LCD menu interface with edit mode
+- LCD menu interface for editing sound parameters
 - ADSR-style envelope with attack, decay, sustain, and release parameters
 - Tremolo modulation using a low-frequency oscillator
 - Structured note profile system for sound parameters
@@ -26,3 +26,8 @@ The synthesizer separates real-time audio generation from slower user-interface 
 The Timer2 interrupt runs at the audio sample rate. Each interrupt updates the DDS phase accumulator, selects the current waveform sample, applies envelope and tremolo scaling, and sends the final sample to the MCP4822 DAC over SPI.
 
 The main loop handles slower tasks such as reading potentiometers, updating the LCD menu, debouncing buttons, and applying changes to the current note profile. This separation prevents slow UI operations from interfering with the real-time audio output.
+
+## Hardware
+
+| Component | Purpose
+| ... | ... |

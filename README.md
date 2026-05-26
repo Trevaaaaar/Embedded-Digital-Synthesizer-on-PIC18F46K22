@@ -104,7 +104,8 @@ The synthesizer was tested and documented incrementally by verifying various har
 
 
 ## Future Improvements
- Add polyphonic note support
+- Add polyphonic note support
+- Implement 12-button matrix as a piano-like input interface
 - Improve enclosure and control layout
 - Add MIDI input
 - Add additional modulation effects such as vibrato

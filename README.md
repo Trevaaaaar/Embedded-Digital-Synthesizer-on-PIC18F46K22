@@ -29,5 +29,11 @@ The main loop handles slower tasks such as reading potentiometers, updating the 
 
 ## Hardware
 
-| Component | Purpose
-| ... | ... |
+| Component | Purpose |
+| --------- | ------- |
+| PIC18F46K22 | Main microcontroller |
+| MCP4822 | 12-bit SPI DAC for audio output |
+| 16x2 LCD | Menu and parameter display |
+| Potentiometers | Analog parameter control |
+| Push buttons | Note trigger and menu navigation |
+| Audio jack / amplifier | Audio output |

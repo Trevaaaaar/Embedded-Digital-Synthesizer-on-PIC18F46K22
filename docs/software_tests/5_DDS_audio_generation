@@ -1,0 +1,167 @@
+#include <xc.h>
+#include <stdint.h>
+#include <math.h>
+#include "PIC18F46K22-Config.h"
+
+#define _XTAL_FREQ 64000000UL
+// ---------- Pin aliases ----------
+#define CS_PIN      LATCbits.LATC2
+#define CS_TRIS     TRISCbits.TRISC2
+#define SCK_TRIS    TRISCbits.TRISC3
+#define SDI_TRIS    TRISCbits.TRISC4
+#define SDO_TRIS    TRISCbits.TRISC5
+
+// MCP4822 channel select bit (bit 15 of the 16-bit command word)
+#define DAC_CHAN_A  0
+#define DAC_CHAN_B  1
+#define GAIN_2X     0   // bit=0 → 2x gain
+#define GAIN_1X     1   // bit=1 → 1x gain
+
+// DDS Settings
+#define SAMPLE_RATE 10000UL     // Audio sample rate: 10 kHz, max output freq = 5kHz
+#define TABLE_SIZE 256          // Wavetable has 256 samples
+#define PHASE_SHIFT 24          // Top 8 bits of 32-bit phase select table index
+                                // Bottom 24 bits is fractional position
+
+
+// phase_incr = freq * 2^32 / 10,000
+const uint32_t note_phase_incr[2] = {112369229, 119047903, 126126009, 133629317,
+141575007, 149993142, 158909494, 168362718, 178369991, 188978561, 200214195,
+212119844, 224734163};
+
+//Wavetable for sine wave with hard-coded values
+const uint16_t sine_table[256] = {
+2048,2098,2148,2198,2248,2298,2348,2397,2447,2496,2545,2594,2643,2691,2739,2787,
+2834,2881,2927,2973,3018,3063,3107,3150,3193,3235,3276,3317,3357,3396,3434,3472,
+3508,3544,3579,3613,3646,3678,3709,3739,3768,3796,3823,3849,3873,3897,3919,3941,
+3961,3980,3998,4015,4030,4045,4058,4070,4081,4091,4099,4106,4112,4117,4120,4122,
+4123,4123,4122,4120,4117,4112,4106,4099,4091,4081,4070,4058,4045,4030,4015,3998,
+3980,3961,3941,3919,3897,3873,3849,3823,3796,3768,3739,3709,3678,3646,3613,3579,
+3544,3508,3472,3434,3396,3357,3317,3276,3235,3193,3150,3107,3063,3018,2973,2927,
+2881,2834,2787,2739,2691,2643,2594,2545,2496,2447,2397,2348,2298,2248,2198,2148,
+2098,2048,1998,1948,1898,1848,1798,1749,1699,1650,1601,1552,1503,1455,1407,1359,
+1312,1265,1219,1173,1128,1083,1039,996,953,911,870,829,789,750,712,674,
+638,602,567,533,500,468,437,407,378,350,323,297,273,249,227,205,
+185,166,148,131,116,101,88,76,65,55,47,40,34,29,26,24,
+23,23,24,26,29,34,40,47,55,65,76,88,101,116,131,148,
+166,185,205,227,249,273,297,323,350,378,407,437,468,500,533,567,
+602,638,674,712,750,789,829,870,911,953,996,1039,1083,1128,1173,1219,
+1265,1312,1359,1407,1455,1503,1552,1601,1650,1699,1749,1798,1848,1898,1948,1998
+};
+
+volatile uint32_t phase_accum = 0;                  // DDS phase accumulator
+volatile uint32_t phase_incr = 0;    // DDS phase increment controls pitch
+
+void mcp4822_write(uint8_t channel, uint8_t gain, uint16_t code){
+    // Build 16-bit command word
+    // Bit 15:   channel select (0=A, 1=B)
+    // Bit 14:   don't care (0)
+    // Bit 13:   /GA gain (0=2x, 1=1x)
+    // Bit 12:   /SHDN (1=active)
+    // Bits 11-0: 12-bit data
+    uint16_t cmd = 0;
+    cmd |= ((uint16_t)(channel & 0x01)) << 15;  // Set CHA or CHB
+    cmd |= ((uint16_t)(gain    & 0x01)) << 13;  // Set GAIN
+    cmd |= (1u << 12);                          // /SHDN = 1 (active)
+    cmd |= (code & 0x0FFF);                     // 
+
+    CS_PIN = 0;                                 // assert /CS
+    
+    SSPBUF = (uint8_t)(cmd >> 8); //Send high byte of SPI command
+    while(!SSPSTATbits.BF);         //Wait till done sending
+    (void)SSPBUF;                   //Clears SSPSTATbits.BF by reading the received data (which we ignore)
+    SSPBUF = (uint8_t)(cmd & 0xFF); //Send low byte of SPI command
+    while(!SSPSTATbits.BF);         
+    (void)SSPBUF;
+    
+    CS_PIN = 1;                                 // deassert /CS — latches output
+}
+void mcp4822_set_mv(uint8_t channel, uint16_t millivolts){
+    // Clamp to 4095 max (just under 4096 mV with 2x gain)
+    if (millivolts > 4095) millivolts = 4095;
+    mcp4822_write(channel, GAIN_1X, (uint16_t)millivolts);
+}
+
+void SPI_init(void){
+    SCK_TRIS = 0;   // SCK
+    SDO_TRIS = 0;   // SDO
+    SDI_TRIS = 1;   // SDI
+    CS_TRIS = 0;            // CS
+
+    CS_PIN = 1;     // CS idle high
+    
+    SSPSTATbits.SMP = 0;    //Sample the input at middle of data output time
+    SSPSTATbits.CKE = 1;    //Transmit occurs on active->idle clock state (high->low)
+
+    SSPCON1bits.CKP  = 0;   //Idle state for clock is low level
+    SSPCON1bits.SSPM = 0b0010;   // Master, Fosc/64 = 1MHz
+    SSPCON1bits.SSPEN = 1;  //Enable serial port (SCK,SDO,SDI)
+}
+
+
+//==============================================
+void timer2_init(void){
+    INTCONbits.GIE = 1;     // Enable global interrupts
+    INTCONbits.PEIE = 1;    // Enable peripheral interrupts
+    PIE1bits.TMR2IE = 1;    // Enable TMR2 interrupts
+    
+    PIR1bits.TMR2IF = 0;    // Clear TMR2 flag
+    T2CONbits.TMR2ON = 0;   // Turn off TMR2 while configuring
+    TMR2 = 0;               // Clear TMR2
+    /*
+       Fosc = 64 MHz
+       Instruction clock = Fosc / 4 = 16 MHz
+       Timer tick with prescaler 16 = 1 us
+
+       For 10 kHz sample rate:
+       sample period = 100 us
+
+       Timer2 period = (PR2 + 1) * prescaler * instruction_cycle
+                    = (99 + 1) * 16 * 62.5 ns
+                    = 100 us
+    */
+    PR2 = 99;
+    T2CONbits.T2CKPS = 0b10;    //prescale 1:16
+    T2CONbits.T2OUTPS = 0b0000; //postscale 1:1
+    T2CONbits.TMR2ON = 1;       //start timer2
+}
+//==============================================
+void main(void)
+{
+    ANSELA = 0x00;
+    ANSELC = 0x00;
+    OSCCON  = 0b01110000;
+    OSCTUNE = 0b01000000;
+
+    SPI_init();
+    timer2_init();
+    __delay_ms(10);
+    
+    //test play note C
+    phase_incr = note_phase_incr[1];
+    
+    while(1);
+}
+
+void __interrupt() ISR(void){
+    uint8_t sine_index = 0;
+    uint16_t sample_val = 0;
+    
+    if (PIR1bits.TMR2IF){
+        PIR1bits.TMR2IF = 0;    //Clear tmr2 interrupt flag
+        //DDS step 1: advance phase by phase increment
+        phase_accum += phase_incr;
+        
+        //DDS step 2: Use top 8 bits of 32-bit phase accumulator as sine table index
+        sine_index = (uint8_t)(phase_accum >> PHASE_SHIFT);
+        
+        
+        //DDS step 3: Read current sine sample from table
+        sample_val = sine_table[sine_index];                      //Sine wave outputs
+        //sample_val = (phase_accum & 0x80000000) ? 4095 : 0;       //Square wave outputs
+        //sample_val = phase_accum >> 20;                           //Sawtooth wave outputs
+        
+        //DDS step 4: send sample to DAC
+        mcp4822_write(DAC_CHAN_A, GAIN_1X, sample_val);
+    }
+}

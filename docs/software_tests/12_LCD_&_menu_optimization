@@ -1,0 +1,363 @@
+#include <xc.h>
+#include <stdint.h>
+#include <stdbool.h>
+#include "PIC18F46K22-Config.h"
+#include "LCD.h"
+
+#define _XTAL_FREQ 64000000UL
+
+// ===============================================================
+// Timer0 1 ms tick
+
+volatile uint8_t control_tick_flag = 0;
+
+void timer0_init(void)
+{
+    INTCONbits.TMR0IE = 1;
+    INTCONbits.TMR0IF = 0;
+
+    T0CONbits.TMR0ON = 0;
+    T0CONbits.T08BIT = 0;
+    T0CONbits.T0CS = 0;
+    T0CONbits.PSA = 0;
+    T0CONbits.T0PS = 0b100; // 1:32 prescale
+
+    // 1 ms preload at 64 MHz
+    // Timer tick = 62.5 ns * 32 = 2 us
+    // 1 ms / 2 us = 500 counts
+    // 65536 - 500 = 65036 = 0xFE0C
+    TMR0H = 0xFE;
+    TMR0L = 0x0C;
+
+    T0CONbits.TMR0ON = 1;
+}
+
+// ===============================================================
+// ADC
+
+void ADC_init(void)
+{
+    ANSELA = 0x00;
+    ANSELB = 0x00;
+    ANSELC = 0x00;
+    ANSELD = 0x00;
+    ANSELE = 0x00;
+
+    ANSELAbits.ANSA0 = 1;
+    ANSELAbits.ANSA1 = 1;
+
+    TRISAbits.TRISA0 = 1;
+    TRISAbits.TRISA1 = 1;
+
+    CM1CON0bits.C1ON = 0;
+    CM2CON0bits.C2ON = 0;
+
+    ADCON0 = 0b00000001;
+    ADCON1 = 0b00000000;
+    ADCON2 = 0b10111111;
+}
+
+uint16_t read_ADC(uint8_t channel)
+{
+    ADCON0bits.CHS = channel;
+    ADCON0bits.ADON = 1;
+
+    __delay_us(200);
+
+    ADCON0bits.GO_nDONE = 1;
+    while (ADCON0bits.GO_nDONE);
+
+    return ((uint16_t)ADRESH << 8) | ADRESL;
+}
+
+// ===============================================================
+// ADC helpers
+
+uint8_t adc_to_u8(uint16_t adc)
+{
+    return (uint8_t)(adc >> 2); // 0-1023 to 0-255
+}
+
+uint8_t adc_to_percent(uint16_t adc)
+{
+    return (uint8_t)((adc * 100UL) / 1023UL);
+}
+
+uint8_t adc_to_wave(uint16_t adc)
+{
+    if (adc < 256) return 0;
+    if (adc < 512) return 1;
+    if (adc < 768) return 2;
+    return 3;
+}
+
+// ===============================================================
+// Menu state
+
+#define NUM_SCREENS 4
+#define DEBOUNCE_MS 20
+
+#define WAVE_SINE     0
+#define WAVE_SQUARE   1
+#define WAVE_SAW      2
+#define WAVE_TRIANGLE 3
+
+uint8_t screen = 0;
+uint8_t edit_mode = 0;
+uint8_t lcd_dirty = 1;
+
+uint8_t volume = 0;
+uint8_t waveform = WAVE_SINE;
+uint8_t attack = 1;
+uint8_t decay = 1;
+uint8_t sustain = 0;
+uint8_t release = 1;
+uint8_t tremolo = 0;
+
+const char paramLabels[NUM_SCREENS][2][10] = {
+    {"Vol", "Wave"},
+    {"Atk", "Dcy"},
+    {"Sstn", "Rls"},
+    {"Trem", ":)"}
+};
+
+const char waveNames[4][9] = {
+    "Sine",
+    "Square",
+    "Saw",
+    "Triangle"
+};
+
+// ===============================================================
+// Button debounce state
+
+uint8_t screen_btn_cnt = 0;
+uint8_t screen_btn_state = 1;
+uint8_t screen_btn_last = 1;
+uint8_t screen_btn_event = 0;
+
+uint8_t edit_btn_cnt = 0;
+uint8_t edit_btn_state = 1;
+uint8_t edit_btn_last = 1;
+uint8_t edit_btn_event = 0;
+
+#define LCD_UPDATE_MS 100
+
+uint8_t lcd_update_counter = 0;
+
+void debounce_button(uint8_t raw,
+                     uint8_t *last,
+                     uint8_t *cnt,
+                     uint8_t *state,
+                     uint8_t *event)
+{
+    if (raw == *last) {
+        if (*cnt < DEBOUNCE_MS) {
+            (*cnt)++;
+        }
+        else if (*state != raw) {
+            *state = raw;
+
+            // event only on press, assuming active-low button
+            if (*state == 0) {
+                *event = 1;
+            }
+        }
+    }
+    else {
+        *cnt = 0;
+        *last = raw;
+    }
+}
+
+// ===============================================================
+// Controls update
+
+void controls_update(void)
+{
+    uint16_t pot0;
+    uint16_t pot1;
+
+    // Debounce buttons every 1 ms
+    debounce_button(PORTCbits.RC6,
+                    &screen_btn_last,
+                    &screen_btn_cnt,
+                    &screen_btn_state,
+                    &screen_btn_event);
+
+    debounce_button(PORTCbits.RC7,
+                    &edit_btn_last,
+                    &edit_btn_cnt,
+                    &edit_btn_state,
+                    &edit_btn_event);
+
+    if (screen_btn_event) {
+        screen_btn_event = 0;
+
+        screen++;
+        if (screen >= NUM_SCREENS) screen = 0;
+
+        edit_mode = 0;
+        LCD_clear();
+        lcd_dirty = 1;
+    }
+
+    if (edit_btn_event) {
+        edit_btn_event = 0;
+
+        edit_mode = !edit_mode;
+        LCD_clear();
+        lcd_dirty = 1;
+    }
+
+    if (edit_mode) {
+        pot0 = read_ADC(0);
+        pot1 = read_ADC(1);
+
+        switch (screen) {
+            case 0:
+                volume = adc_to_percent(pot0);
+                waveform = adc_to_wave(pot1);
+                break;
+
+            case 1:
+                attack = adc_to_u8(pot0);
+                decay  = adc_to_u8(pot1);
+                break;
+
+            case 2:
+                sustain = adc_to_percent(pot0);
+                release = adc_to_u8(pot1);
+                break;
+
+            case 3:
+                tremolo = adc_to_percent(pot0);
+                break;
+        }
+
+        lcd_dirty = 1;
+    }
+}
+
+// ===============================================================
+// LCD draw
+
+void lcd_draw(void)
+{
+    LCD_cursor_set(1,1);
+    LCD_write_string("                ");
+    LCD_cursor_set(1,1);
+    LCD_write_string(paramLabels[screen][0]);
+    LCD_write_string(":");
+
+    switch (screen) {
+        case 0:
+            LCD_write_variable(volume, 0);
+            LCD_write_string("%");
+            break;
+
+        case 1:
+            LCD_write_variable(attack, 0);
+            break;
+
+        case 2:
+            LCD_write_variable(sustain, 0);
+            LCD_write_string("%");
+            break;
+
+        case 3:
+            LCD_write_variable(tremolo, 0);
+            LCD_write_string("%");
+            break;
+    }
+
+    LCD_cursor_set(2,1);
+    LCD_write_string("                ");
+    LCD_cursor_set(2,1);
+    LCD_write_string(paramLabels[screen][1]);
+    LCD_write_string(":");
+
+    switch (screen) {
+        case 0:
+            LCD_write_string(waveNames[waveform]);
+            break;
+
+        case 1:
+            LCD_write_variable(decay, 0);
+            break;
+
+        case 2:
+            LCD_write_variable(release, 0);
+            break;
+
+        case 3:
+            LCD_write_string(":)");
+            break;
+    }
+
+    LCD_cursor_set(1,15);
+    if (edit_mode) LCD_write_string("E");
+    else LCD_write_string(" ");
+}
+
+// ===============================================================
+// Main
+
+void main(void)
+{
+    OSCCON  = 0b01110000;
+    OSCTUNE = 0b01000000;
+
+    LCD_init();
+    LCD_clear();
+
+    ADC_init();
+
+    // RC6 = screen button
+    // RC7 = edit button
+    TRISCbits.TRISC6 = 1;
+    TRISCbits.TRISC7 = 1;
+    ANSELCbits.ANSC6 = 0;
+    ANSELCbits.ANSC7 = 0;
+
+    timer0_init();
+
+    INTCONbits.PEIE = 1;
+    INTCONbits.GIE = 1;
+
+    lcd_draw();
+
+    while (1) {
+        if (control_tick_flag) {
+            control_tick_flag = 0;
+
+            controls_update();
+
+            lcd_update_counter++;
+
+            if (lcd_update_counter >= LCD_UPDATE_MS) {
+                lcd_update_counter = 0;
+
+                if (lcd_dirty) {
+                    lcd_dirty = 0;
+                    lcd_draw();
+                }
+            }
+        }
+    }
+}
+
+// ===============================================================
+// ISR
+
+void __interrupt() ISR(void)
+{
+    if (INTCONbits.TMR0IF) {
+        INTCONbits.TMR0IF = 0;
+
+        TMR0H = 0xFE;
+        TMR0L = 0x0C;
+
+        control_tick_flag = 1;
+    }
+}

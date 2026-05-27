@@ -1,1 +1,229 @@
+#include <xc.h>
+#include <stdlib.h>
+#include <stdbool.h>
+#include "PIC18F46K22-Config.h"
+#include "LCD.h"
 
+#define _XTAL_FREQ 64000000
+
+#define NUM_PARAMS 8
+#define NUM_SCREENS 4
+
+#define WAVE_SINE   0
+#define WAVE_SQUARE 1
+#define WAVE_SAW    2
+#define WAVE_TRIANGLE 3
+
+typedef struct {
+    int no;
+    float max;
+    float min;
+    float val;
+} Param;
+
+Param paramArray[NUM_PARAMS];
+
+int screen = 0;
+int screen_start[NUM_SCREENS] = {0, 2, 4, 6};
+
+char paramLabels[NUM_SCREENS][2][10] = {
+    {"Vol", "Wave"},
+    {"Atk", "Dcy"},
+    {"Sstn Vol", "Rls Time"},
+    {"Tremolo", ":)"}
+};
+
+char waveNames[4][8] = {
+    "Sine",
+    "Square",
+    "Saw",
+    "Triangle"
+};
+
+int prev_screen_button = 1;
+int prev_edit_button = 1;
+int prev_wave_button = 1;
+
+int edit_mode = 0;
+uint8_t waveform = WAVE_SINE;
+
+void ADC_init(void){
+    ANSELA = 0x00;
+    ANSELB = 0x00;
+    ANSELC = 0x00;
+    ANSELD = 0x00;
+    ANSELE = 0x00;
+
+    ANSELAbits.ANSA0 = 1;
+    ANSELAbits.ANSA1 = 1;
+
+    TRISAbits.TRISA0 = 1;
+    TRISAbits.TRISA1 = 1;
+
+    CM1CON0bits.C1ON = 0;
+    CM2CON0bits.C2ON = 0;
+
+    ADCON0 = 0b00000001;
+    ADCON1 = 0b00000000;
+    ADCON2 = 0b10111111;
+}
+unsigned int read_ADC(unsigned char channel){
+    ADCON0bits.CHS = channel;
+    ADCON0bits.ADON = 1;
+
+    __delay_us(200);
+
+    ADCON0bits.GO_nDONE = 1;
+    while (ADCON0bits.GO_nDONE);
+
+    return (((unsigned int)ADRESH << 8) | ADRESL);
+}
+float adc_percent(unsigned int adc){
+    return ((float)adc / 1023.0) * 100.0;
+}
+float adc_ms(unsigned int adc){
+    return ((float)adc / 1023.0) * 1000.0;
+}
+
+void main(void)
+{
+    OSCCON = 0b01110000;
+    OSCTUNEbits.PLLEN = 1;
+
+    LCD_init();
+    LCD_clear();
+
+    ADC_init();
+
+    // RC6 = screen button
+    TRISCbits.TRISC6 = 1;
+    ANSELCbits.ANSC6 = 0;
+
+    // RC7 = edit button
+    TRISCbits.TRISC7 = 1;
+    ANSELCbits.ANSC7 = 0;
+
+    for (int i = 0; i < NUM_PARAMS; i++)
+    {
+        paramArray[i].no = i;
+        paramArray[i].min = 0;
+        paramArray[i].max = 100;
+        paramArray[i].val = 0;
+    }
+
+    while (1)
+    {
+        int current_screen_button = PORTCbits.RC6;
+        int current_edit_button = PORTCbits.RC7;
+        int current_wave_button = PORTAbits.RA2;
+
+        // ===== SCREEN BUTTON =====
+        if (prev_screen_button == 1 && current_screen_button == 0)
+        {
+            screen++;
+            if (screen >= NUM_SCREENS)
+                screen = 0;
+
+            edit_mode = 0;
+            LCD_clear();
+            __delay_ms(200);
+        }
+        prev_screen_button = current_screen_button;
+
+        // ===== EDIT BUTTON =====
+        if (prev_edit_button == 1 && current_edit_button == 0)
+        {
+            edit_mode = !edit_mode;
+            LCD_clear();
+            __delay_ms(200);
+        }
+        prev_edit_button = current_edit_button;
+
+        int p0_index = screen_start[screen] + 0;
+        int p1_index = screen_start[screen] + 1;
+
+        // ===== UPDATE =====
+        if (edit_mode)
+        {
+            if (screen == 0)
+            {
+                paramArray[0].val = adc_percent(read_ADC(0)); //read vol
+                paramArray[1].val = adc_percent(read_ADC(1)); //assign wave percent value
+                uint16_t wave_select_var = paramArray[1].val;
+                if (wave_select_var >= 0 && wave_select_var <= 24){
+                    waveform = 0;
+                } else if (wave_select_var >= 25 && wave_select_var <= 49){
+                    waveform = 1;
+                } else if (wave_select_var >= 50 && wave_select_var <= 74){
+                    waveform = 2;
+                } else {
+                    waveform = 3;
+                }
+                
+            }
+            else if (screen == 1)
+            {
+                paramArray[2].val = adc_ms(read_ADC(0));
+                paramArray[3].val = adc_ms(read_ADC(1));
+            }
+            else if (screen == 2)
+            {
+                paramArray[4].val = adc_percent(read_ADC(0));
+                paramArray[5].val = adc_ms(read_ADC(1));
+            }
+            else if (screen == 3)
+            {
+                paramArray[6].val = adc_percent(read_ADC(0));
+            }
+        }
+
+        prev_wave_button = current_wave_button;
+
+        // ===== DISPLAY =====
+        LCD_cursor_set(1,1);
+        LCD_write_string("                ");
+        LCD_cursor_set(1,1);
+        LCD_write_string(paramLabels[screen][0]);
+        LCD_write_string(":");
+
+        if (screen == 1)
+        {
+            LCD_write_variable((int)paramArray[p0_index].val, 0);
+            LCD_write_string("ms");
+        }
+        else
+        {
+            LCD_write_variable((int)paramArray[p0_index].val, 0);
+            LCD_write_string("%");
+        }
+
+        LCD_cursor_set(2,1);
+        LCD_write_string("                ");
+        LCD_cursor_set(2,1);
+        LCD_write_string(paramLabels[screen][1]);
+        LCD_write_string(":");
+
+        if (screen == 0)
+        {
+            LCD_write_string(waveNames[waveform]);
+        }
+        else if (screen == 1 || screen == 2)
+        {
+            LCD_write_variable((int)paramArray[p1_index].val, 0);
+            LCD_write_string("ms");
+        }
+        else
+        {
+            LCD_write_string(":)");
+        }
+
+        // edit indicator
+        LCD_cursor_set(1,15);
+        if (edit_mode)
+            LCD_write_string("E");
+        else
+            LCD_write_string(" ");
+
+        __delay_ms(100);
+    }
+}

@@ -1,0 +1,941 @@
+#include <xc.h>
+#include <stdint.h>
+#include <stdbool.h>
+#include "PIC18F46K22-Config.h"
+#include "LCD.h"
+
+#define _XTAL_FREQ 64000000
+
+// ===============================================================
+/*SPI / DAC */
+#define CS_PIN      LATCbits.LATC2
+#define CS_TRIS     TRISCbits.TRISC2
+#define SCK_TRIS    TRISCbits.TRISC3
+#define SDI_TRIS    TRISCbits.TRISC4
+#define SDO_TRIS    TRISCbits.TRISC5
+
+// MCP4822 channel select bit (bit 15 of the 16-bit command word)
+#define DAC_CHAN_A  0
+#define DAC_CHAN_B  1
+#define GAIN_2X     0
+#define GAIN_1X     1
+
+void mcp4822_write(uint8_t channel, uint8_t gain, uint16_t code)
+{
+    uint16_t cmd = 0;
+
+    cmd |= ((uint16_t)(channel & 0x01)) << 15;
+    cmd |= ((uint16_t)(gain & 0x01)) << 13;
+    cmd |= (1u << 12);
+    cmd |= (code & 0x0FFF);
+
+    CS_PIN = 0;
+
+    SSPBUF = (uint8_t)(cmd >> 8);
+    while (!SSPSTATbits.BF);
+    (void)SSPBUF;
+
+    SSPBUF = (uint8_t)(cmd & 0xFF);
+    while (!SSPSTATbits.BF);
+    (void)SSPBUF;
+
+    CS_PIN = 1;
+}
+
+void SPI_init(void)
+{
+    SCK_TRIS = 0;
+    SDO_TRIS = 0;
+    SDI_TRIS = 1;
+    CS_TRIS = 0;
+
+    CS_PIN = 1;
+
+    SSPSTATbits.SMP = 0;
+    SSPSTATbits.CKE = 1;
+
+    SSPCON1bits.CKP = 0;
+    SSPCON1bits.SSPM = 0b0001; // Fosc / 16 = 4 MHz
+    SSPCON1bits.SSPEN = 1;
+}
+
+// ===============================================================
+/*DDS Settings*/
+#define SAMPLE_RATE 10000UL
+#define TABLE_SIZE 256
+#define PHASE_SHIFT 24
+
+#define SINE_WAVE     0
+#define SQUARE_WAVE   1
+#define SAWTOOTH_WAVE 2
+#define TRIANGLE_WAVE 3
+
+const uint32_t note_phase_incr[13] = {
+    112369229, 119047903, 126126009, 133629317,
+    141575007, 149993142, 158909494, 168362718,
+    178369991, 188978561, 200214195, 212119844,
+    224734163
+};          // PITCH    
+volatile uint8_t note_index;
+
+// ===============================================================
+/* Note profile struct (presets) */
+typedef struct note_profile {
+    uint8_t volume;          // 0-255
+    uint8_t wave_type;       // SINE_WAVE, SQUARE_WAVE, etc.
+    uint16_t attack_ms;      // 1-255 ms
+    uint16_t decay_ms;       // 1-255 ms
+    uint8_t sustain_level;   // 0-255
+    uint16_t release_ms;     // 1-255 ms
+    uint8_t tremolo_depth;   // 0-255
+    uint8_t note_index;      // note index selects DDS phase increment
+} note_profile;
+
+#define NUM_PRESETS 4
+note_profile preset_array[NUM_PRESETS] = {
+    // volume, wave, attack, decay, sustain, release, tremolo, pitch
+    {255, SINE_WAVE,     20,  80, 180, 100,   0, 0}, // clean sine
+    {220, SQUARE_WAVE,    5,  40, 200,  40,  30, 0}, // chiptune
+    {200, SAWTOOTH_WAVE, 50, 120, 150, 180,  80, 0}, // pad-ish
+    {255, TRIANGLE_WAVE, 10,  60, 160,  80, 150, 0}  // tremolo
+};
+uint8_t preset_index = 0;
+
+// CHANGE: audio_params is the ONLY parameter struct the sound ISR reads.
+// UI should not edit this directly.
+volatile note_profile audio_params = {
+    255,
+    SINE_WAVE,
+    1,
+    1,
+    160,
+    1,
+    0,
+    0
+};
+
+// CHANGE: ui_params is edited by ADC/buttons/LCD menu.
+// It gets copied into audio_params safely.
+note_profile ui_params = {
+    255,
+    SINE_WAVE,
+    1,
+    1,
+    160,
+    1,
+    0,
+    0
+};
+
+// ===============================================================
+/*Wave type stuff*/
+volatile uint32_t phase_accum = 0;
+volatile uint32_t phase_incr = 0;
+
+const uint16_t sine_table[256] = {
+2048,2098,2148,2198,2248,2298,2348,2397,2447,2496,2545,2594,2643,2691,2739,2787,
+2834,2881,2927,2973,3018,3063,3107,3150,3193,3235,3276,3317,3357,3396,3434,3472,
+3508,3544,3579,3613,3646,3678,3709,3739,3768,3796,3823,3849,3873,3897,3919,3941,
+3961,3980,3998,4015,4030,4045,4058,4070,4081,4091,4095,4095,4095,4095,4095,4095,
+4095,4095,4095,4095,4095,4095,4095,4095,4091,4081,4070,4058,4045,4030,4015,3998,
+3980,3961,3941,3919,3897,3873,3849,3823,3796,3768,3739,3709,3678,3646,3613,3579,
+3544,3508,3472,3434,3396,3357,3317,3276,3235,3193,3150,3107,3063,3018,2973,2927,
+2881,2834,2787,2739,2691,2643,2594,2545,2496,2447,2397,2348,2298,2248,2198,2148,
+2098,2048,1998,1948,1898,1848,1798,1749,1699,1650,1601,1552,1503,1455,1407,1359,
+1312,1265,1219,1173,1128,1083,1039,996,953,911,870,829,789,750,712,674,
+638,602,567,533,500,468,437,407,378,350,323,297,273,249,227,205,
+185,166,148,131,116,101,88,76,65,55,47,40,34,29,26,24,
+23,23,24,26,29,34,40,47,55,65,76,88,101,116,131,148,
+166,185,205,227,249,273,297,323,350,378,407,437,468,500,533,567,
+602,638,674,712,750,789,829,870,911,953,996,1039,1083,1128,1173,1219,
+1265,1312,1359,1407,1455,1503,1552,1601,1650,1699,1749,1798,1848,1898,1948,1998
+};
+
+// ===============================================================
+/*Volume / Envelope / Tremolo*/
+
+#define ENV_IDLE     0
+#define ENV_ATTACK   1
+#define ENV_DECAY    2
+#define ENV_SUSTAIN  3
+#define ENV_RELEASE  4
+
+volatile uint8_t env_level = 0;
+volatile uint8_t env_state = ENV_IDLE;
+
+volatile uint8_t attack_step = 1;                                                 // ATTACK RATE
+volatile uint8_t decay_step = 1;                                                  // DECAY RATE
+volatile uint8_t release_step = 1;                                                // RELEASE RATE
+
+volatile uint8_t env_tick_flag = 0;
+
+const int8_t lfo_sine_table[256] = {
+0,3,6,9,12,16,19,22,25,28,31,34,37,40,43,46,
+48,51,54,57,60,62,65,68,70,73,75,78,80,83,85,87,
+90,92,94,96,98,100,102,104,106,108,110,111,113,115,116,118,
+119,120,122,123,124,125,126,126,127,127,127,127,127,127,127,126,
+126,125,124,123,122,120,119,118,116,115,113,111,110,108,106,104,
+102,100,98,96,94,92,90,87,85,83,80,78,75,73,70,68,
+65,62,60,57,54,51,48,46,43,40,37,34,31,28,25,22,
+19,16,12,9,6,3,0,-3,-6,-9,-12,-16,-19,-22,-25,-28,
+-31,-34,-37,-40,-43,-46,-48,-51,-54,-57,-60,-62,-65,-68,-70,-73,
+-75,-78,-80,-83,-85,-87,-90,-92,-94,-96,-98,-100,-102,-104,-106,-108,
+-110,-111,-113,-115,-116,-118,-119,-120,-122,-123,-124,-125,-126,-126,-127,-127,
+-127,-127,-127,-127,-127,-126,-126,-125,-124,-123,-122,-120,-119,-118,-116,-115,
+-113,-111,-110,-108,-106,-104,-102,-100,-98,-96,-94,-92,-90,-87,-85,-83,
+-80,-78,-75,-73,-70,-68,-65,-62,-60,-57,-54,-51,-48,-46,-43,-40,
+-37,-34,-31,-28,-25,-22,-19,-16,-12,-9,-6,-3
+};
+
+volatile uint32_t lfo_phase_accum = 0;
+volatile uint32_t lfo_phase_incr = 858993UL; // about 2 Hz
+
+// CHANGE: envelope steps now come from audio_params,
+// because that is the committed sound-engine state.
+void update_envelope_steps(void){
+    attack_step = 255 / audio_params.attack_ms;
+    decay_step = 255 / audio_params.decay_ms;
+    release_step = 255 / audio_params.release_ms;
+
+    if (attack_step == 0) attack_step = 1;
+    if (decay_step == 0) decay_step = 1;
+    if (release_step == 0) release_step = 1;
+}
+
+// CHANGE: single controlled bridge from UI system to sound engine.
+void synth_apply_params(void)
+{
+    // Briefly disable interrupts so ISR cannot read half-updated params.
+    INTCONbits.GIE = 0;
+
+    audio_params = ui_params;
+    if (audio_params.note_index >= 13) {
+        audio_params.note_index = 0;
+    }
+
+    phase_incr = note_phase_incr[audio_params.note_index];
+    note_index = audio_params.note_index;
+
+    INTCONbits.GIE = 1;
+
+    update_envelope_steps();
+}
+
+// ===============================================================
+/* TMR0 + debounce*/
+
+#define DEBOUNCE_MS 20
+
+volatile uint8_t control_tick_flag = 0;
+
+volatile uint8_t rd0_cnt = 0;
+volatile uint8_t rd0_state = 1;
+volatile uint8_t rd0_last = 1;
+volatile uint8_t rd0_event = 0;
+
+void timer0_init(void)
+{
+    INTCONbits.TMR0IE = 1;
+    INTCONbits.TMR0IF = 0;
+
+    T0CONbits.TMR0ON = 0;
+    T0CONbits.T08BIT = 0;
+    T0CONbits.T0CS = 0;
+    T0CONbits.PSA = 0;
+    T0CONbits.T0PS = 0b100;
+
+    TMR0H = 0xFE;
+    TMR0L = 0x0C;
+
+    T0CONbits.TMR0ON = 1;
+}
+
+// ===============================================================
+/* TMR2 */
+
+void timer2_init(void)
+{
+    INTCONbits.GIE = 1;
+    INTCONbits.PEIE = 1;
+    PIE1bits.TMR2IE = 1;
+
+    PIR1bits.TMR2IF = 0;
+    T2CONbits.TMR2ON = 0;
+    TMR2 = 0;
+
+    PR2 = 99;
+    T2CONbits.T2CKPS = 0b10;
+    T2CONbits.T2OUTPS = 0b0000;
+    T2CONbits.TMR2ON = 1;
+}
+
+// ===============================================================
+/* ADC */
+
+void ADC_init(void)
+{
+    ANSELA = 0x00;
+    ANSELB = 0x00;
+    ANSELC = 0x00;
+    ANSELD = 0x00;
+    ANSELE = 0x00;
+
+    ANSELAbits.ANSA0 = 1;
+    ANSELAbits.ANSA1 = 1;
+
+    TRISAbits.TRISA0 = 1;
+    TRISAbits.TRISA1 = 1;
+
+    CM1CON0bits.C1ON = 0;
+    CM2CON0bits.C2ON = 0;
+
+    ADCON0 = 0b00000001;
+    ADCON1 = 0b00000000;
+    ADCON2 = 0b10111111;
+}
+
+// CHANGE: measured ADC limits from your pots
+#define ADC_MIN 40      
+#define ADC_MAX 940
+
+uint16_t adc_calibrated(uint16_t adc)
+{
+    if (adc <= ADC_MIN) return 0;
+    if (adc >= ADC_MAX) return 1023;
+
+    return (uint16_t)(((uint32_t)(adc - ADC_MIN) * 1023UL) /
+                      (ADC_MAX - ADC_MIN));
+}
+
+uint16_t read_ADC(uint8_t channel)
+{
+    ADCON0bits.CHS = channel;
+    ADCON0bits.ADON = 1;
+
+    __delay_us(200);
+
+    ADCON0bits.GO_nDONE = 1;
+    while (ADCON0bits.GO_nDONE);
+
+    return ((uint16_t)ADRESH << 8) | ADRESL;
+}
+
+uint8_t adc_to_u8(uint16_t adc)
+{
+    adc = adc_calibrated(adc);
+
+    // CHANGE: gives 0-255, with endpoints reachable
+    return (uint8_t)((adc * 255UL + 511UL) / 1023UL);
+}
+
+uint8_t adc_to_percent(uint16_t adc)
+{
+    adc = adc_calibrated(adc);
+
+    // CHANGE: gives 0-100%, with endpoints reachable
+    return (uint8_t)((adc * 100UL + 511UL) / 1023UL);
+}
+
+uint8_t adc_to_wave(uint16_t adc)
+{
+    adc = adc_calibrated(adc);
+
+    if (adc < 256) return SINE_WAVE;
+    if (adc < 512) return SQUARE_WAVE;
+    if (adc < 768) return SAWTOOTH_WAVE;
+    return TRIANGLE_WAVE;
+}
+
+uint16_t adc_to_ms(uint16_t adc)
+{
+    adc = adc_calibrated(adc);
+
+    return 1 + ((uint32_t)adc * 254UL) / 1023UL;
+}
+
+// CHANGE: converts ADC value into 13 pitch steps, index 0-12
+uint8_t adc_to_note_index(uint16_t adc)
+{
+    adc = adc_calibrated(adc);
+
+    // CHANGE: maps full pot travel to notes 0-12, so C4 and C5 are reachable
+    return (uint8_t)(((uint32_t)adc * 13UL) / 1024UL);
+}
+
+// ===============================================================
+/* LCD Menu */
+
+#define NUM_SCREENS 5
+#define LCD_UPDATE_MS 100
+
+uint8_t screen = 0;
+uint8_t edit_mode = 0;
+uint8_t lcd_dirty = 1;
+
+uint8_t display_attack = 1;
+uint8_t display_decay = 1;
+uint8_t display_sustain = 0;
+uint8_t display_release = 1;
+uint8_t display_tremolo = 0;
+
+const char paramLabels[NUM_SCREENS][2][10] = {
+    {"Vol", "Wave"},
+    {"Atk", "Dcy"},
+    {"Sstn", "Rls"},
+    {"Trem", "Note"},
+    {"Preset", "D1 btn"}
+};
+
+const char waveNames[4][9] = {
+    "Sine",
+    "Square",
+    "Saw",
+    "Triangle"
+};
+const char noteNames[13][3] = {
+    "C", "C#", "D", "Eb", "E", "F", "F#", "G", "Ab", "A", "Bb", "B", "C5"
+};
+volatile uint8_t note_index = 0;
+
+// ===============================================================
+/* Button debounce state */
+
+uint8_t screen_btn_cnt = 0;
+uint8_t screen_btn_state = 1;
+uint8_t screen_btn_last = 1;
+uint8_t screen_btn_event = 0;
+
+uint8_t edit_btn_cnt = 0;
+uint8_t edit_btn_state = 1;
+uint8_t edit_btn_last = 1;
+uint8_t edit_btn_event = 0;
+
+uint8_t lcd_update_counter = 0;
+
+void debounce_button(uint8_t raw,
+                     uint8_t *last,
+                     uint8_t *cnt,
+                     uint8_t *state,
+                     uint8_t *event)
+{
+    if (raw == *last) {
+        if (*cnt < DEBOUNCE_MS) {
+            (*cnt)++;
+        }
+        else if (*state != raw) {
+            *state = raw;
+            if (*state == 0) {
+                *event = 1;
+            }
+        }
+    }
+    else {
+        *cnt = 0;
+        *last = raw;
+    }
+}
+
+// ===============================================================
+/* Preset and EEPROM stuff*/
+#define SAVE_ADC_VAL 800
+const char save_options[2][10] = {"Load", "Save"};
+uint8_t save_options_index = 0;
+
+// D1 save button debounce variables
+volatile uint8_t rd1_cnt = 0;
+volatile uint8_t rd1_state = 1;
+volatile uint8_t rd1_last = 1;
+volatile uint8_t rd1_event = 0;
+
+uint8_t EEPROM_ReadByte(uint16_t address){
+    EEADRH = (uint8_t) (address >> 8);    // Load EEPROM address
+    EEADR = (uint8_t)(address & 0xFF);
+    
+    EECON1bits.EEPGD = 0;           // Data EEPROM
+    EECON1bits.CFGS = 0;            // Not configuration registers
+    EECON1bits.RD = 1;              // Start read
+    
+    return EEDATA;      // Return EEPROM data
+}
+
+// Read multiple bytes from consecutive EEPROM addresses into a data array
+void EEPROM_ReadBlock(uint16_t start_addr, uint8_t *data, uint8_t length){
+    for (uint8_t i = 0; i < length; i++) {
+        data[i] = EEPROM_ReadByte(start_addr + i);
+    }
+}
+
+void EEPROM_WriteByte(uint16_t address, uint8_t data){
+    while (EECON1bits.WR);      // Wait if previous write is still active
+    
+    EEADRH = (uint8_t) (address >> 8);    // Load EEPROM address
+    EEADR = (uint8_t)(address & 0xFF);
+    EEDATA = data;                      // Load EEPROM data
+    
+    EECON1bits.EEPGD = 0;           // Data EEPROM
+    EECON1bits.CFGS = 0;            // Not configuration registers
+    EECON1bits.WREN = 1;            // Enable write mode
+    
+    INTCONbits.GIE = 0;             // Disable interrupts during EEPROM unlock
+    
+    EECON2 = 0x55;
+    EECON2 = 0xAA;                  // Required unlock sequence
+    EECON1bits.WR = 1;              // Start write
+    INTCONbits.GIE = 1;             // Re-enable interrupts
+    
+    while (EECON1bits.WR);  // Wait for write to finish
+
+    EECON1bits.WREN = 0;    // Disable writes
+    PIR2bits.EEIF = 0;      // Clear EEPROM interrupt flag if set
+}
+
+// Write multiple bytes into consecutive EEPROM addresses
+void EEPROM_WriteBlock(uint16_t start_addr, uint8_t *data, uint8_t length){
+    for (uint8_t i = 0; i < length; i++) {
+        EEPROM_WriteByte(start_addr + i, data[i]);
+    }
+}
+
+#define EEPROM_PRESET_BASE 0x000                // First EEPROM address
+#define EEPROM_PRESET_SIZE sizeof(note_profile) // # of bytes in note_profile
+
+void EEPROM_init(){
+    for (uint8_t i = 0; i < NUM_PRESETS; i++){
+        uint16_t addr = EEPROM_PRESET_BASE + i * EEPROM_PRESET_SIZE;
+        EEPROM_WriteBlock(addr, (uint8_t *)&preset_array[i], sizeof(note_profile));
+    }
+}
+
+void save_preset(uint8_t preset_index)
+{
+    uint16_t addr = EEPROM_PRESET_BASE + preset_index * EEPROM_PRESET_SIZE;
+
+    EEPROM_WriteBlock(addr, (uint8_t *)&ui_params, sizeof(note_profile));
+}
+
+void load_preset(uint8_t preset_index) // WORK IN PROGRESS
+{
+    uint16_t addr = EEPROM_PRESET_BASE + preset_index * EEPROM_PRESET_SIZE;
+
+    EEPROM_ReadBlock(addr, (uint8_t *)&ui_params, sizeof(note_profile));
+    synth_apply_params();
+    
+    lcd_dirty = 1;
+}
+// ===============================================================
+/* Controls update */
+
+void controls_update(void)
+{
+    uint16_t pot0;
+    uint16_t pot1;
+
+    debounce_button(PORTCbits.RC6,
+                    &screen_btn_last,
+                    &screen_btn_cnt,
+                    &screen_btn_state,
+                    &screen_btn_event);
+
+    debounce_button(PORTCbits.RC7,
+                    &edit_btn_last,
+                    &edit_btn_cnt,
+                    &edit_btn_state,
+                    &edit_btn_event);
+
+    if (screen_btn_event) {
+        screen_btn_event = 0;
+
+        screen++;
+        if (screen >= NUM_SCREENS) screen = 0;
+
+        edit_mode = 0;
+        LCD_clear();
+        lcd_dirty = 1;
+    }
+
+    if (edit_btn_event) {
+        edit_btn_event = 0;
+
+        edit_mode = !edit_mode;
+        LCD_clear();
+        lcd_dirty = 1;
+    }
+
+    if (edit_mode) {
+        pot0 = read_ADC(0);
+        pot1 = read_ADC(1);
+
+        // CHANGE: controls_update edits ui_params only.
+        // It does not directly touch audio_params or phase_incr.
+        switch (screen) {
+            case 0: {
+                ui_params.volume = adc_to_u8(pot0);
+                ui_params.wave_type = adc_to_wave(pot1);
+                break;
+            }
+
+            case 1: {
+                ui_params.attack_ms = adc_to_ms(pot0);
+                ui_params.decay_ms = adc_to_ms(pot1);
+
+                display_attack = ui_params.attack_ms;
+                display_decay  = ui_params.decay_ms;
+                break;
+            }
+
+            case 2: {
+                display_sustain = adc_to_percent(pot0);
+                ui_params.sustain_level = (uint8_t)((display_sustain * 255UL) / 100UL);
+
+                ui_params.release_ms = adc_to_ms(pot1);
+                display_release = ui_params.release_ms;
+                break;
+            }
+
+            case 3: {
+                display_tremolo = adc_to_percent(pot0);
+                ui_params.tremolo_depth = (uint8_t)((display_tremolo * 255UL) / 100UL);
+
+                ui_params.note_index = adc_to_note_index(pot1);
+                note_index = ui_params.note_index;
+                break;
+            }
+            
+            case 4: {
+                preset_index = (uint8_t)(adc_to_u8(pot0) / 32);
+                save_options_index = (pot1 > SAVE_ADC_VAL) ? 1 : 0;
+            }
+        }
+
+        // CHANGE: commit UI params to sound engine in one place.
+        synth_apply_params();
+
+        lcd_dirty = 1;
+    }
+}
+
+void lcd_draw(void)
+{
+    LCD_cursor_set(1,1);
+    LCD_write_string("                ");
+    LCD_cursor_set(1,1);
+    LCD_write_string(paramLabels[screen][0]);
+    LCD_write_string(":");
+
+    switch (screen) {
+        case 0:
+            LCD_write_variable(adc_to_percent((uint16_t)ui_params.volume << 2), 0);
+            LCD_write_string("%");
+            break;
+
+        case 1:
+            LCD_write_variable(display_attack, 0);
+            LCD_write_string("ms");
+            break;
+
+        case 2:
+            LCD_write_variable(display_sustain, 0);
+            LCD_write_string("%");
+            break;
+
+        case 3:
+            LCD_write_variable(display_tremolo, 0);
+            LCD_write_string("%");
+            break;
+        case 4:
+            LCD_write_variable(preset_index,0);
+            break;
+    }
+
+    LCD_cursor_set(2,1);
+    LCD_write_string("                ");
+    LCD_cursor_set(2,1);
+    LCD_write_string(paramLabels[screen][1]);
+    LCD_write_string(":");
+
+    switch (screen) {
+        case 0:
+            LCD_write_string(waveNames[ui_params.wave_type]);
+            break;
+
+        case 1:
+            LCD_write_variable(display_decay, 0);
+            LCD_write_string("ms");
+            break;
+
+        case 2:
+            LCD_write_variable(display_release, 0);
+            LCD_write_string("ms");
+            break;
+
+        case 3:
+            LCD_write_string(noteNames[note_index]);                        // CHANGE: show selected note instead of :)
+            break;
+        case 4:
+            //write lcd save button
+            LCD_write_string(save_options[save_options_index]);
+            break;
+    }
+
+    LCD_cursor_set(1,15);
+    if (edit_mode) LCD_write_string("E");
+    else LCD_write_string(" ");
+}
+
+void lcd_menu_startup_reset(void)
+{
+    screen = 0;        // start on Vol/Wave screen
+    edit_mode = 0;     // start NOT editing
+    lcd_dirty = 1;
+
+    screen_btn_cnt = 0;
+    screen_btn_state = PORTCbits.RC6;
+    screen_btn_last = PORTCbits.RC6;
+    screen_btn_event = 0;
+
+    edit_btn_cnt = 0;
+    edit_btn_state = PORTCbits.RC7;
+    edit_btn_last = PORTCbits.RC7;
+    edit_btn_event = 0;
+
+    LCD_clear();
+}
+
+// ===============================================================
+/* Envelope helpers*/
+
+void note_on(void)
+{
+    // CHANGE: note_on starts sound using committed audio params.
+    synth_apply_params();
+
+    phase_accum = 0;
+    env_state = ENV_ATTACK;
+}
+
+void note_off(void)
+{
+    env_state = ENV_RELEASE;
+}
+
+void envelope_update(void)
+{
+    switch (env_state) {
+        case ENV_ATTACK:
+            if (env_level + attack_step >= 255) {
+                env_level = 255;
+                env_state = ENV_DECAY;
+            } else {
+                env_level += attack_step;
+            }
+            break;
+
+        case ENV_DECAY:
+            if (env_level <= audio_params.sustain_level + decay_step) {
+                env_level = audio_params.sustain_level;
+                env_state = ENV_SUSTAIN;
+            } else {
+                env_level -= decay_step;
+            }
+            break;
+
+        case ENV_SUSTAIN:
+            env_level = audio_params.sustain_level;
+            break;
+
+        case ENV_RELEASE:
+            if (env_level <= release_step) {
+                env_level = 0;
+                env_state = ENV_IDLE;
+            } else {
+                env_level -= release_step;
+            }
+            break;
+
+        case ENV_IDLE:
+        default:
+            env_level = 0;
+            break;
+    }
+}
+
+// ===============================================================
+/* Main */
+
+void main(void)
+{
+    ANSELA = 0x00;
+    ANSELB = 0x00;
+    ANSELC = 0x00;
+    ANSELD = 0x00;
+    ANSELE = 0x00;
+
+    OSCCON = 0b01110000;
+    OSCTUNE = 0b01000000;
+
+    TRISDbits.TRISD0 = 1; // note button
+    TRISDbits.TRISD1 = 1; // save button
+
+    TRISCbits.TRISC6 = 1; // screen button
+    TRISCbits.TRISC7 = 1; // edit button
+    ANSELCbits.ANSC6 = 0;
+    ANSELCbits.ANSC7 = 0;
+    
+    TRISCbits.TRISC0 = 0; // test output
+    LATCbits.LATC0 = 0;   // start at 0
+
+    LCD_init();
+    LCD_clear();
+
+    ADC_init();
+    SPI_init();
+    timer2_init();
+    timer0_init();
+    
+    //EEPROM_init();        // was already called, only uncomment when doing factory reset
+    
+    // CHANGE: initialize UI params, then commit once to audio engine.
+    ui_params.note_index = note_index;
+    load_preset(0);
+    __delay_ms(10);
+    lcd_menu_startup_reset();
+    lcd_draw();
+
+    while (1) {
+        if (env_tick_flag) {
+            env_tick_flag = 0;
+            envelope_update();                                                  //progress
+        }
+
+        if (rd0_event) {
+            rd0_event = 0;
+            note_on();
+        }
+
+        if (rd0_state == 1 &&
+            env_state != ENV_IDLE &&
+            env_state != ENV_RELEASE) {
+            note_off();
+        }
+
+        if (control_tick_flag) { //once every 1ms
+            control_tick_flag = 0;
+
+            controls_update();
+            
+            debounce_button(PORTDbits.RD1,
+                    &rd1_last,
+                    &rd1_cnt,
+                    &rd1_state,
+                    &rd1_event);
+            
+            if (rd1_event) {
+                rd1_event = 0;
+
+                if (screen == 4 && edit_mode) {
+                    if (save_options_index == 0) {
+                        load_preset(preset_index);
+
+                        display_attack  = ui_params.attack_ms;
+                        display_decay   = ui_params.decay_ms;
+                        display_sustain = (uint8_t)(((uint16_t)ui_params.sustain_level * 100UL + 127UL) / 255UL);
+                        display_release = ui_params.release_ms;
+                        display_tremolo = (uint8_t)(((uint16_t)ui_params.tremolo_depth * 100UL + 127UL) / 255UL);
+                    }
+                    else {
+                        save_preset(preset_index);
+                    }
+
+                    lcd_dirty = 1;
+                }
+            }
+            
+            lcd_update_counter++;
+            if (lcd_update_counter >= LCD_UPDATE_MS) {
+                lcd_update_counter = 0;
+
+                if (lcd_dirty) {
+                    lcd_dirty = 0;
+                    lcd_draw();
+                }
+            }
+        }
+    }
+}
+
+// ===============================================================
+/* ISR */
+void __interrupt() ISR(void)
+{
+    if (PIR1bits.TMR2IF) {
+        PIR1bits.TMR2IF = 0;
+
+        uint8_t sine_index;
+        uint16_t sample_val;
+        uint16_t dac_output;
+
+        lfo_phase_accum += lfo_phase_incr;
+        phase_accum += phase_incr;
+
+        switch (audio_params.wave_type) {
+            case SINE_WAVE:
+                sine_index = (uint8_t)(phase_accum >> PHASE_SHIFT);
+                sample_val = sine_table[sine_index];
+                break;
+
+            case SQUARE_WAVE:
+                sample_val = (phase_accum & 0x80000000) ? 4095 : 0;
+                break;
+
+            case SAWTOOTH_WAVE:
+                sample_val = phase_accum >> 20;
+                break;
+
+            case TRIANGLE_WAVE:
+                if (phase_accum & 0x80000000) {
+                    sample_val = 4095 - ((phase_accum >> 19) & 0x0FFF);
+                } else {
+                    sample_val = (phase_accum >> 19) & 0x0FFF;
+                }
+                break;
+
+            default:
+                sine_index = (uint8_t)(phase_accum >> PHASE_SHIFT);
+                sample_val = sine_table[sine_index];
+                break;
+        }
+
+        uint8_t lfo_index = (uint8_t)(lfo_phase_accum >> PHASE_SHIFT);
+        int8_t lfo_signed = lfo_sine_table[lfo_index];
+
+        uint16_t lfo_0_255 = (uint16_t)((int16_t)lfo_signed + 127);
+        uint16_t trem_gain = 255 - (((uint16_t)audio_params.tremolo_depth * (255 - lfo_0_255)) >> 8);
+
+        uint16_t env_trem_gain = ((uint16_t)env_level * trem_gain) >> 8;
+        uint16_t total_gain = ((uint16_t)audio_params.volume * env_trem_gain) >> 8;
+
+        int32_t centered = (int32_t)sample_val - 2048;
+        int32_t final_vol = (centered * total_gain) >> 8;
+
+        dac_output = (uint16_t)(2048 + final_vol);
+
+        mcp4822_write(DAC_CHAN_A, GAIN_1X, dac_output);
+    }
+
+    if (INTCONbits.TMR0IF) {
+        INTCONbits.TMR0IF = 0;
+
+        TMR0H = 0xFE;
+        TMR0L = 0x0C;
+
+        control_tick_flag = 1;
+        env_tick_flag = 1;
+
+        debounce_button(PORTDbits.RD0,
+                    &rd0_last,
+                    &rd0_cnt,
+                    &rd0_state,
+                    &rd0_event);
+        
+    }
+}

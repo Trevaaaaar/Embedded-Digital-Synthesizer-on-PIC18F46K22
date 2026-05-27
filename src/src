@@ -75,7 +75,8 @@ const uint32_t note_phase_incr[13] = {
     141575007, 149993142, 158909494, 168362718,
     178369991, 188978561, 200214195, 212119844,
     224734163
-};                              // PITCH    
+};          // PITCH    
+volatile uint8_t note_index;
 
 // ===============================================================
 /* Note profile struct (presets) */
@@ -87,8 +88,18 @@ typedef struct note_profile {
     uint8_t sustain_level;   // 0-255
     uint16_t release_ms;     // 1-255 ms
     uint8_t tremolo_depth;   // 0-255
-    uint32_t pitch;          // DDS phase increment
+    uint8_t note_index;      // note index selects DDS phase increment
 } note_profile;
+
+#define NUM_PRESETS 4
+note_profile preset_array[NUM_PRESETS] = {
+    // volume, wave, attack, decay, sustain, release, tremolo, pitch
+    {255, SINE_WAVE,     20,  80, 180, 100,   0, 0}, // clean sine
+    {220, SQUARE_WAVE,    5,  40, 200,  40,  30, 0}, // chiptune
+    {200, SAWTOOTH_WAVE, 50, 120, 150, 180,  80, 0}, // pad-ish
+    {255, TRIANGLE_WAVE, 10,  60, 160,  80, 150, 0}  // tremolo
+};
+uint8_t preset_index = 0;
 
 // CHANGE: audio_params is the ONLY parameter struct the sound ISR reads.
 // UI should not edit this directly.
@@ -100,7 +111,7 @@ volatile note_profile audio_params = {
     160,
     1,
     0,
-    112369229
+    0
 };
 
 // CHANGE: ui_params is edited by ADC/buttons/LCD menu.
@@ -113,14 +124,13 @@ note_profile ui_params = {
     160,
     1,
     0,
-    112369229
+    0
 };
 
 // ===============================================================
 /*Wave type stuff*/
 volatile uint32_t phase_accum = 0;
 volatile uint32_t phase_incr = 0;
-volatile uint8_t wave_type_index = SINE_WAVE;                                     // WAVE TYPE
 
 const uint16_t sine_table[256] = {
 2048,2098,2148,2198,2248,2298,2348,2397,2447,2496,2545,2594,2643,2691,2739,2787,
@@ -144,8 +154,6 @@ const uint16_t sine_table[256] = {
 // ===============================================================
 /*Volume / Envelope / Tremolo*/
 
-volatile uint8_t volume = 255;                                                    // VOLUME
-
 #define ENV_IDLE     0
 #define ENV_ATTACK   1
 #define ENV_DECAY    2
@@ -158,7 +166,6 @@ volatile uint8_t env_state = ENV_IDLE;
 volatile uint8_t attack_step = 1;                                                 // ATTACK RATE
 volatile uint8_t decay_step = 1;                                                  // DECAY RATE
 volatile uint8_t release_step = 1;                                                // RELEASE RATE
-volatile uint8_t sustain_level = 160;                                             // SUSTAIN VOLUME
 
 volatile uint8_t env_tick_flag = 0;
 
@@ -182,12 +189,10 @@ const int8_t lfo_sine_table[256] = {
 
 volatile uint32_t lfo_phase_accum = 0;
 volatile uint32_t lfo_phase_incr = 858993UL; // about 2 Hz
-volatile uint8_t tremolo_depth = 0;                                               // TREMOLO DEPTH
 
 // CHANGE: envelope steps now come from audio_params,
 // because that is the committed sound-engine state.
-void update_envelope_steps(void)
-{
+void update_envelope_steps(void){
     attack_step = 255 / audio_params.attack_ms;
     decay_step = 255 / audio_params.decay_ms;
     release_step = 255 / audio_params.release_ms;
@@ -204,7 +209,12 @@ void synth_apply_params(void)
     INTCONbits.GIE = 0;
 
     audio_params = ui_params;
-    phase_incr = audio_params.pitch;
+    if (audio_params.note_index >= 13) {
+        audio_params.note_index = 0;
+    }
+
+    phase_incr = note_phase_incr[audio_params.note_index];
+    note_index = audio_params.note_index;
 
     INTCONbits.GIE = 1;
 
@@ -285,8 +295,8 @@ void ADC_init(void)
 }
 
 // CHANGE: measured ADC limits from your pots
-#define ADC_MIN 40      // about 16 after >>2
-#define ADC_MAX 980     // about 240 after >>2
+#define ADC_MIN 40      
+#define ADC_MAX 940
 
 uint16_t adc_calibrated(uint16_t adc)
 {
@@ -355,7 +365,7 @@ uint8_t adc_to_note_index(uint16_t adc)
 // ===============================================================
 /* LCD Menu */
 
-#define NUM_SCREENS 4
+#define NUM_SCREENS 5
 #define LCD_UPDATE_MS 100
 
 uint8_t screen = 0;
@@ -372,7 +382,8 @@ const char paramLabels[NUM_SCREENS][2][10] = {
     {"Vol", "Wave"},
     {"Atk", "Dcy"},
     {"Sstn", "Rls"},
-    {"Trem", "Note"}
+    {"Trem", "Note"},
+    {"Preset", "D1 btn"}
 };
 
 const char waveNames[4][9] = {
@@ -424,6 +435,93 @@ void debounce_button(uint8_t raw,
     }
 }
 
+// ===============================================================
+/* Preset and EEPROM stuff*/
+#define SAVE_ADC_VAL 800
+const char save_options[2][10] = {"Load", "Save"};
+uint8_t save_options_index = 0;
+
+// D1 save button debounce variables
+volatile uint8_t rd1_cnt = 0;
+volatile uint8_t rd1_state = 1;
+volatile uint8_t rd1_last = 1;
+volatile uint8_t rd1_event = 0;
+
+uint8_t EEPROM_ReadByte(uint16_t address){
+    EEADRH = (uint8_t) (address >> 8);    // Load EEPROM address
+    EEADR = (uint8_t)(address & 0xFF);
+    
+    EECON1bits.EEPGD = 0;           // Data EEPROM
+    EECON1bits.CFGS = 0;            // Not configuration registers
+    EECON1bits.RD = 1;              // Start read
+    
+    return EEDATA;      // Return EEPROM data
+}
+
+// Read multiple bytes from consecutive EEPROM addresses into a data array
+void EEPROM_ReadBlock(uint16_t start_addr, uint8_t *data, uint8_t length){
+    for (uint8_t i = 0; i < length; i++) {
+        data[i] = EEPROM_ReadByte(start_addr + i);
+    }
+}
+
+void EEPROM_WriteByte(uint16_t address, uint8_t data){
+    while (EECON1bits.WR);      // Wait if previous write is still active
+    
+    EEADRH = (uint8_t) (address >> 8);    // Load EEPROM address
+    EEADR = (uint8_t)(address & 0xFF);
+    EEDATA = data;                      // Load EEPROM data
+    
+    EECON1bits.EEPGD = 0;           // Data EEPROM
+    EECON1bits.CFGS = 0;            // Not configuration registers
+    EECON1bits.WREN = 1;            // Enable write mode
+    
+    INTCONbits.GIE = 0;             // Disable interrupts during EEPROM unlock
+    
+    EECON2 = 0x55;
+    EECON2 = 0xAA;                  // Required unlock sequence
+    EECON1bits.WR = 1;              // Start write
+    INTCONbits.GIE = 1;             // Re-enable interrupts
+    
+    while (EECON1bits.WR);  // Wait for write to finish
+
+    EECON1bits.WREN = 0;    // Disable writes
+    PIR2bits.EEIF = 0;      // Clear EEPROM interrupt flag if set
+}
+
+// Write multiple bytes into consecutive EEPROM addresses
+void EEPROM_WriteBlock(uint16_t start_addr, uint8_t *data, uint8_t length){
+    for (uint8_t i = 0; i < length; i++) {
+        EEPROM_WriteByte(start_addr + i, data[i]);
+    }
+}
+
+#define EEPROM_PRESET_BASE 0x000                // First EEPROM address
+#define EEPROM_PRESET_SIZE sizeof(note_profile) // # of bytes in note_profile
+
+void EEPROM_init(){
+    for (uint8_t i = 0; i < NUM_PRESETS; i++){
+        uint16_t addr = EEPROM_PRESET_BASE + i * EEPROM_PRESET_SIZE;
+        EEPROM_WriteBlock(addr, (uint8_t *)&preset_array[i], sizeof(note_profile));
+    }
+}
+
+void save_preset(uint8_t preset_index)
+{
+    uint16_t addr = EEPROM_PRESET_BASE + preset_index * EEPROM_PRESET_SIZE;
+
+    EEPROM_WriteBlock(addr, (uint8_t *)&ui_params, sizeof(note_profile));
+}
+
+void load_preset(uint8_t preset_index) // WORK IN PROGRESS
+{
+    uint16_t addr = EEPROM_PRESET_BASE + preset_index * EEPROM_PRESET_SIZE;
+
+    EEPROM_ReadBlock(addr, (uint8_t *)&ui_params, sizeof(note_profile));
+    synth_apply_params();
+    
+    lcd_dirty = 1;
+}
 // ===============================================================
 /* Controls update */
 
@@ -498,9 +596,14 @@ void controls_update(void)
                 display_tremolo = adc_to_percent(pot0);
                 ui_params.tremolo_depth = (uint8_t)((display_tremolo * 255UL) / 100UL);
 
-                note_index = adc_to_note_index(pot1);
-                ui_params.pitch = note_phase_incr[note_index];
+                ui_params.note_index = adc_to_note_index(pot1);
+                note_index = ui_params.note_index;
                 break;
+            }
+            
+            case 4: {
+                preset_index = (uint8_t)(adc_to_u8(pot0) / 32);
+                save_options_index = (pot1 > SAVE_ADC_VAL) ? 1 : 0;
             }
         }
 
@@ -539,6 +642,9 @@ void lcd_draw(void)
             LCD_write_variable(display_tremolo, 0);
             LCD_write_string("%");
             break;
+        case 4:
+            LCD_write_variable(preset_index,0);
+            break;
     }
 
     LCD_cursor_set(2,1);
@@ -565,6 +671,10 @@ void lcd_draw(void)
         case 3:
             LCD_write_string(noteNames[note_index]);                        // CHANGE: show selected note instead of :)
             break;
+        case 4:
+            //write lcd save button
+            LCD_write_string(save_options[save_options_index]);
+            break;
     }
 
     LCD_cursor_set(1,15);
@@ -590,13 +700,13 @@ void lcd_menu_startup_reset(void)
 
     LCD_clear();
 }
+
 // ===============================================================
 /* Envelope helpers*/
 
-void note_on(uint8_t note_index)
+void note_on(void)
 {
     // CHANGE: note_on starts sound using committed audio params.
-    ui_params.pitch = note_phase_incr[note_index];
     synth_apply_params();
 
     phase_accum = 0;
@@ -664,11 +774,15 @@ void main(void)
     OSCTUNE = 0b01000000;
 
     TRISDbits.TRISD0 = 1; // note button
+    TRISDbits.TRISD1 = 1; // save button
 
     TRISCbits.TRISC6 = 1; // screen button
     TRISCbits.TRISC7 = 1; // edit button
     ANSELCbits.ANSC6 = 0;
     ANSELCbits.ANSC7 = 0;
+    
+    TRISCbits.TRISC0 = 0; // test output
+    LATCbits.LATC0 = 0;   // start at 0
 
     LCD_init();
     LCD_clear();
@@ -678,9 +792,11 @@ void main(void)
     timer2_init();
     timer0_init();
     
+    //EEPROM_init();        // was already called, only uncomment when doing factory reset
+    
     // CHANGE: initialize UI params, then commit once to audio engine.
-    ui_params.pitch = note_phase_incr[note_index];
-    synth_apply_params();
+    ui_params.note_index = note_index;
+    load_preset(0);
     __delay_ms(10);
     lcd_menu_startup_reset();
     lcd_draw();
@@ -693,7 +809,7 @@ void main(void)
 
         if (rd0_event) {
             rd0_event = 0;
-            note_on(note_index);                                            // CHANGE: use selected pitch instead of fixed note_on(3)
+            note_on();
         }
 
         if (rd0_state == 1 &&
@@ -702,11 +818,38 @@ void main(void)
             note_off();
         }
 
-        if (control_tick_flag) {
+        if (control_tick_flag) { //once every 1ms
             control_tick_flag = 0;
 
             controls_update();
+            
+            debounce_button(PORTDbits.RD1,
+                    &rd1_last,
+                    &rd1_cnt,
+                    &rd1_state,
+                    &rd1_event);
+            
+            if (rd1_event) {
+                rd1_event = 0;
 
+                if (screen == 4 && edit_mode) {
+                    if (save_options_index == 0) {
+                        load_preset(preset_index);
+
+                        display_attack  = ui_params.attack_ms;
+                        display_decay   = ui_params.decay_ms;
+                        display_sustain = (uint8_t)(((uint16_t)ui_params.sustain_level * 100UL + 127UL) / 255UL);
+                        display_release = ui_params.release_ms;
+                        display_tremolo = (uint8_t)(((uint16_t)ui_params.tremolo_depth * 100UL + 127UL) / 255UL);
+                    }
+                    else {
+                        save_preset(preset_index);
+                    }
+
+                    lcd_dirty = 1;
+                }
+            }
+            
             lcd_update_counter++;
             if (lcd_update_counter >= LCD_UPDATE_MS) {
                 lcd_update_counter = 0;
@@ -722,7 +865,6 @@ void main(void)
 
 // ===============================================================
 /* ISR */
-
 void __interrupt() ISR(void)
 {
     if (PIR1bits.TMR2IF) {
@@ -789,22 +931,11 @@ void __interrupt() ISR(void)
         control_tick_flag = 1;
         env_tick_flag = 1;
 
-        uint8_t raw = PORTDbits.RD0;
-
-        if (raw == rd0_last) {
-            if (rd0_cnt < DEBOUNCE_MS) {
-                rd0_cnt++;
-            }
-            else if (rd0_state != raw) {
-                rd0_state = raw;
-                if (rd0_state == 0) {
-                    rd0_event = 1;
-                }
-            }
-        }
-        else {
-            rd0_cnt = 0;
-            rd0_last = raw;
-        }
+        debounce_button(PORTDbits.RD0,
+                    &rd0_last,
+                    &rd0_cnt,
+                    &rd0_state,
+                    &rd0_event);
+        
     }
 }

@@ -27,6 +27,7 @@ The Timer2 interrupt runs at the audio sample rate. Each interrupt updates the D
 
 The main loop handles slower tasks such as reading potentiometers, updating the LCD menu, debouncing buttons, and applying changes to the current note profile. This separation prevents slow UI operations from interfering with the real-time audio output.
 <img width="1767" height="543" alt="image" src="https://github.com/user-attachments/assets/c554bf3b-c97d-4ea9-a29e-9ab64f7a7de4" />
+This block diagram can be found in `docs/images/`.
 
 
 ## Hardware
@@ -106,3 +107,15 @@ The synthesizer was tested and documented incrementally by verifying various har
 - Improve enclosure and control layout
 - Add MIDI input
 - Add additional modulation effects such as vibrato
+
+## Build / Development Environment
+- MCU: PIC18F46K22
+- IDE: MPLAB X
+- Compiler: XC8
+- DAC: MCP4822 over SPI
+- Display: 16x2 LCD
+
+## Repository Structure
+- `src/` - final firmware source code
+- `docs/images/` - block diagram and project images
+- `docs/software_tests/` - incremental test programs used during bring-up

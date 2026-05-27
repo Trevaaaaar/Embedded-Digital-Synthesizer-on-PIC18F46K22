@@ -41,6 +41,18 @@ This block diagram can be found in `docs/images/`.
 | Push buttons | Note trigger and menu navigation |
 | Audio jack / amplifier | Audio output |
 
+| Signal | PIC18F46K22 Pin | Connected To | Purpose |
+|---|---|---|---|
+| SDO | RC5 | MCP4822 SDI | SPI data to DAC |
+| SCK | RC3 | MCP4822 SCK | SPI clock |
+| CS | RC2 | MCP4822 CS | DAC chip select |
+| AN0 | RA0 | Potentiometer 1 | Parameter control |
+| AN1 | RA1 | Potentiometer 2 | Parameter control |
+| RD0 | RD0 | Push button | Note trigger |
+| RD1 | RD1 | Push button | EEPROM save/load |
+| RC6 | RC6 | Push button | Menu screen select |
+| RC7 | RC7 | Push button | Edit mode toggle |
+
 ## Timing and Performance
 | Parameter | Value |
 |---|---|

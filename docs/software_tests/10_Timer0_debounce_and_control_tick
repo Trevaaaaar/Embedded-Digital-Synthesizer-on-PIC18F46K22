@@ -1,0 +1,476 @@
+#include <xc.h>
+#include <stdint.h>
+#include "PIC18F46K22-Config.h"
+
+#define _XTAL_FREQ 64000000UL
+// ===============================================================
+/*SPI Stuff*/
+#define CS_PIN      LATCbits.LATC2
+#define CS_TRIS     TRISCbits.TRISC2
+#define SCK_TRIS    TRISCbits.TRISC3
+#define SDI_TRIS    TRISCbits.TRISC4
+#define SDO_TRIS    TRISCbits.TRISC5
+
+// MCP4822 channel select bit (bit 15 of the 16-bit command word)
+#define DAC_CHAN_A  0
+#define DAC_CHAN_B  1
+#define GAIN_2X     0   // bit=0 ? 2x gain
+#define GAIN_1X     1   // bit=1 ? 1x gain
+
+void mcp4822_write(uint8_t channel, uint8_t gain, uint16_t code){
+    // Build 16-bit command word
+    // Bit 15:   channel select (0=A, 1=B)
+    // Bit 14:   don't care (0)
+    // Bit 13:   /GA gain (0=2x, 1=1x)
+    // Bit 12:   /SHDN (1=active)
+    // Bits 11-0: 12-bit data
+    uint16_t cmd = 0;
+    cmd |= ((uint16_t)(channel & 0x01)) << 15;  // Set CHA or CHB
+    cmd |= ((uint16_t)(gain    & 0x01)) << 13;  // Set GAIN
+    cmd |= (1u << 12);                          // /SHDN = 1 (active)
+    cmd |= (code & 0x0FFF);                     // 
+
+    CS_PIN = 0;                                 // assert /CS
+    
+    SSPBUF = (uint8_t)(cmd >> 8); //Send high byte of SPI command
+    while(!SSPSTATbits.BF);         //Wait till done sending
+    (void)SSPBUF;                   //Clears SSPSTATbits.BF by reading the received data (which we ignore)
+    SSPBUF = (uint8_t)(cmd & 0xFF); //Send low byte of SPI command
+    while(!SSPSTATbits.BF);         
+    (void)SSPBUF;
+    
+    CS_PIN = 1;                                 // deassert /CS ? latches output
+}
+void SPI_init(void){
+    SCK_TRIS = 0;   // SCK
+    SDO_TRIS = 0;   // SDO
+    SDI_TRIS = 1;   // SDI
+    CS_TRIS = 0;            // CS
+
+    CS_PIN = 1;     // CS idle high
+    
+    SSPSTATbits.SMP = 0;    //Sample the input at middle of data output time
+    SSPSTATbits.CKE = 1;    //Transmit occurs on active->idle clock state (high->low)
+
+    SSPCON1bits.CKP  = 0;   //Idle state for clock is low level
+    SSPCON1bits.SSPM = 0b0001;   // Master, Fosc/16 = 4MHz
+    SSPCON1bits.SSPEN = 1;  //Enable serial port (SCK,SDO,SDI)
+}
+
+// ===============================================================
+/*DDS Settings*/
+#define SAMPLE_RATE 10000UL     // Audio sample rate: 10 kHz, max output freq = 5kHz
+#define TABLE_SIZE 256          // Wavetable has 256 samples
+#define PHASE_SHIFT 24          // Top 8 bits of 32-bit phase select table index, bottom 24 bits is fractional position
+
+// phase_incr = freq * 2^32 / 10,000
+const uint32_t note_phase_incr[13] = {112369229, 119047903, 126126009, 133629317,
+141575007, 149993142, 158909494, 168362718, 178369991, 188978561, 200214195,
+212119844, 224734163};
+volatile uint32_t phase_accum = 0;   // DDS phase accumulator
+volatile uint32_t phase_incr = 0;    // DDS phase increment controls pitch
+
+// ===============================================================
+/*Wave type stuff*/
+#define SINE_WAVE 0
+#define SQUARE_WAVE 1
+#define SAWTOOTH_WAVE 2
+#define TRIANGLE_WAVE 3
+
+volatile uint8_t wave_type_index = 0;   // Index controlling wave type
+//Wavetable for sine wave with hard-coded values
+const uint16_t sine_table[256] = {
+2048,2098,2148,2198,2248,2298,2348,2397,2447,2496,2545,2594,2643,2691,2739,2787,
+2834,2881,2927,2973,3018,3063,3107,3150,3193,3235,3276,3317,3357,3396,3434,3472,
+3508,3544,3579,3613,3646,3678,3709,3739,3768,3796,3823,3849,3873,3897,3919,3941,
+3961,3980,3998,4015,4030,4045,4058,4070,4081,4091,4095,4095,4095,4095,4095,4095,
+4095,4095,4095,4095,4095,4095,4095,4095,4091,4081,4070,4058,4045,4030,4015,3998,
+3980,3961,3941,3919,3897,3873,3849,3823,3796,3768,3739,3709,3678,3646,3613,3579,
+3544,3508,3472,3434,3396,3357,3317,3276,3235,3193,3150,3107,3063,3018,2973,2927,
+2881,2834,2787,2739,2691,2643,2594,2545,2496,2447,2397,2348,2298,2248,2198,2148,
+2098,2048,1998,1948,1898,1848,1798,1749,1699,1650,1601,1552,1503,1455,1407,1359,
+1312,1265,1219,1173,1128,1083,1039,996,953,911,870,829,789,750,712,674,
+638,602,567,533,500,468,437,407,378,350,323,297,273,249,227,205,
+185,166,148,131,116,101,88,76,65,55,47,40,34,29,26,24,
+23,23,24,26,29,34,40,47,55,65,76,88,101,116,131,148,
+166,185,205,227,249,273,297,323,350,378,407,437,468,500,533,567,
+602,638,674,712,750,789,829,870,911,953,996,1039,1083,1128,1173,1219,
+1265,1312,1359,1407,1455,1503,1552,1601,1650,1699,1749,1798,1848,1898,1948,1998
+};
+
+// ===============================================================
+/*Volume stuff*/
+#define NUM_VOLUME_LEVELS 4
+const uint8_t volume_levels[NUM_VOLUME_LEVELS] = {0, 32, 128, 255};
+volatile uint8_t volume_index = 3;
+// ^replace for pot input
+
+volatile uint8_t volume = 255; // Starts at full volume.
+
+// ===============================================================
+/*Envelope stuff*/
+#define ENV_IDLE     0
+#define ENV_ATTACK   1
+#define ENV_DECAY    2
+#define ENV_SUSTAIN  3
+#define ENV_RELEASE  4
+
+volatile uint8_t env_level = 0;        // 0=silent, 255=full volume
+volatile uint8_t env_state = ENV_IDLE; // current envelope stage
+
+volatile uint8_t attack_step = 1;      // bigger = faster attack
+volatile uint8_t decay_step  = 1;      // bigger = faster decay
+volatile uint8_t release_step = 1;       // Bigger = faster release
+volatile uint8_t sustain_level = 160;    // Held volume after decay, 0-255
+
+volatile uint8_t env_tick_flag = 0;
+
+void note_on(uint8_t note_index){
+    phase_incr = note_phase_incr[note_index]; // Set the pitch of the note
+    phase_accum = 0;                          // Restart waveform from beginning
+    //env_level = 0;                            // Start envelope at silence
+    env_state = ENV_ATTACK;                   // Start attack mode
+}
+void note_off(void){
+    env_state = ENV_RELEASE;    //Begin fade-out
+}
+void envelope_update(void){
+    switch(env_state){
+
+        case ENV_ATTACK:
+            if (env_level + attack_step >= 255){
+                env_level = 255;
+                env_state = ENV_DECAY;
+            } else {
+                env_level += attack_step;
+            }
+            break;
+
+        case ENV_DECAY:
+            if (env_level <= sustain_level + decay_step){
+                env_level = sustain_level;
+                env_state = ENV_SUSTAIN;
+            } else {
+                env_level -= decay_step;
+            }
+            break;
+
+        case ENV_SUSTAIN:
+            env_level = sustain_level;
+            break;
+
+        case ENV_RELEASE:
+            if (env_level <= release_step){
+                env_level = 0;
+                env_state = ENV_IDLE;
+            } else {
+                env_level -= release_step;
+            }
+            break;
+
+        case ENV_IDLE:
+        default:
+            env_level = 0;
+            break;
+    }
+}
+
+// ===============================================================
+/*Tremolo stuff*/
+const int8_t lfo_sine_table[256] = {
+0,3,6,9,12,16,19,22,25,28,31,34,37,40,43,46,
+48,51,54,57,60,62,65,68,70,73,75,78,80,83,85,87,
+90,92,94,96,98,100,102,104,106,108,110,111,113,115,116,118,
+119,120,122,123,124,125,126,126,127,127,127,127,127,127,127,126,
+126,125,124,123,122,120,119,118,116,115,113,111,110,108,106,104,
+102,100,98,96,94,92,90,87,85,83,80,78,75,73,70,68,
+65,62,60,57,54,51,48,46,43,40,37,34,31,28,25,22,
+19,16,12,9,6,3,0,-3,-6,-9,-12,-16,-19,-22,-25,-28,
+-31,-34,-37,-40,-43,-46,-48,-51,-54,-57,-60,-62,-65,-68,-70,-73,
+-75,-78,-80,-83,-85,-87,-90,-92,-94,-96,-98,-100,-102,-104,-106,-108,
+-110,-111,-113,-115,-116,-118,-119,-120,-122,-123,-124,-125,-126,-126,-127,-127,
+-127,-127,-127,-127,-127,-126,-126,-125,-124,-123,-122,-120,-119,-118,-116,-115,
+-113,-111,-110,-108,-106,-104,-102,-100,-98,-96,-94,-92,-90,-87,-85,-83,
+-80,-78,-75,-73,-70,-68,-65,-62,-60,-57,-54,-51,-48,-46,-43,-40,
+-37,-34,-31,-28,-25,-22,-19,-16,-12,-9,-6,-3
+};
+// LFO DDS
+volatile uint32_t lfo_phase_accum = 0;
+// lfo_phase_incr = LFO_freq * 2^32 / SAMPLE_RATE
+// For 5 Hz at 10 kHz sample rate:
+// 5 * 4294967296 / 10000 = 2147483
+volatile uint32_t lfo_phase_incr = 858993UL; //2Hz LFO =========
+// Tremolo depth: 0-255.0 = no tremolo, 255 = extreme tremolo.
+volatile uint8_t tremolo_depth = 150; //volume percentage to oscillate =====
+
+// ===============================================================
+/*TMR0 debouncing and button matrix*/
+volatile uint8_t control_tick_flag = 0; //for timer0
+
+#define DEBOUNCE_MS 20
+
+volatile uint8_t rc0_cnt = 0, rc1_cnt = 0, rd0_cnt = 0;
+volatile uint8_t rc0_state = 1, rc1_state = 1, rd0_state = 1;
+volatile uint8_t rc0_last  = 1, rc1_last  = 1, rd0_last  = 1;
+
+volatile uint8_t rc0_event = 0;
+volatile uint8_t rc1_event = 0;
+volatile uint8_t rd0_event = 0;
+
+void timer0_init(void){     //~1ms interrupt
+    INTCONbits.TMR0IE = 1;  //Enable TMR0 interrupts
+    INTCONbits.TMR0IF = 0;  //Clear TMR0 flag
+    T0CONbits.TMR0ON = 0;   // Stop Timer0 during setup
+    T0CONbits.T08BIT = 0;   // 0 = 16-bit timer
+    T0CONbits.T0CS = 0;     // 0 = internal clock
+    T0CONbits.PSA = 0;      // 0 = prescaler assigned
+    T0CONbits.T0PS = 0b100; // 1:32
+    // Preload for 1 ms overflow
+    TMR0H = 0xFE; //Timer tick = 62.5 ns × 32 = 2 µs
+    TMR0L = 0x0C; //1 ms / 2 µs = 500 counts
+                  //65536 - 500 = 65036 = 0xFE0C
+    T0CONbits.TMR0ON = 1; //Start timer
+}
+
+#define NO_KEY 0xFF
+uint8_t scan_matrix_2x2(void){
+    LATBbits.LATB0 = 0;
+    LATBbits.LATB1 = 1;
+    __delay_us(5);
+
+    if (!PORTBbits.RB2) { LATBbits.LATB0 = 1; return 0; }
+    if (!PORTBbits.RB3) { LATBbits.LATB0 = 1; return 1; }
+
+    LATBbits.LATB0 = 1;
+    LATBbits.LATB1 = 0;
+    __delay_us(5);
+
+    if (!PORTBbits.RB2) { LATBbits.LATB1 = 1; return 2; }
+    if (!PORTBbits.RB3) { LATBbits.LATB1 = 1; return 3; }
+
+    LATBbits.LATB0 = 1;
+    LATBbits.LATB1 = 1;
+    return NO_KEY;
+}
+// ===============================================================
+
+void timer2_init(void){
+    INTCONbits.GIE = 1;     // Enable global interrupts
+    INTCONbits.PEIE = 1;    // Enable peripheral interrupts
+    PIE1bits.TMR2IE = 1;    // Enable TMR2 interrupts
+    
+    PIR1bits.TMR2IF = 0;    // Clear TMR2 flag
+    T2CONbits.TMR2ON = 0;   // Turn off TMR2 while configuring
+    TMR2 = 0;               // Clear TMR2
+    /*
+       Fosc = 64 MHz
+       Instruction clock = Fosc / 4 = 16 MHz
+       Timer tick with prescaler 16 = 1 us
+
+       For 10 kHz sample rate: sample period = 100 us
+       Timer2 period = (PR2 + 1) * prescaler * instruction_cycle
+                    = (99 + 1) * 16 * 62.5 ns = 100us
+    */
+    PR2 = 99;
+    T2CONbits.T2CKPS = 0b10;    //prescale 1:16
+    T2CONbits.T2OUTPS = 0b0000; //postscale 1:1
+    T2CONbits.TMR2ON = 1;       //start timer2
+}
+
+void main(void){
+    ANSELA = 0x00;
+    ANSELC = 0x00;
+    ANSELD = 0x00;
+    OSCCON  = 0b01110000;
+    OSCTUNE = 0b01000000;
+    
+    TRISCbits.TRISC0 = 1; //C0 button input for volume change
+    TRISCbits.TRISC1 = 1; //C1 button input for wave type change
+    TRISDbits.TRISD0 = 1; //D0 button for ...
+    
+    ANSELB = 0x00;
+
+    TRISBbits.TRISB0 = 0;
+    TRISBbits.TRISB1 = 0;
+    TRISBbits.TRISB2 = 1;
+    TRISBbits.TRISB3 = 1;
+
+    INTCON2bits.RBPU = 0;
+    WPUBbits.WPUB2 = 1;
+    WPUBbits.WPUB3 = 1;
+
+    LATBbits.LATB0 = 1;
+    LATBbits.LATB1 = 1;
+
+    SPI_init();
+    timer2_init();
+    timer0_init();
+    __delay_ms(10);
+    
+    while(1) {
+        
+        uint8_t key = scan_matrix_2x2();
+
+        if (key != NO_KEY) {
+            __delay_ms(20);              // debounce
+
+            if (scan_matrix_2x2() == key) {
+                phase_incr = note_phase_incr[key];
+
+                while (scan_matrix_2x2() == key);
+                __delay_ms(20);
+            }
+        }
+        
+        if (env_tick_flag) {
+            env_tick_flag = 0;
+            envelope_update();
+        }
+        if (rc0_event) {
+            rc0_event = 0;
+            volume_index = (volume_index + 1) % NUM_VOLUME_LEVELS;
+            volume = volume_levels[volume_index];
+        }
+
+        if (rc1_event) {
+            rc1_event = 0;
+            wave_type_index = (wave_type_index + 1) % 4;
+        }
+
+        if (rd0_event) {
+            rd0_event = 0;
+            note_on(3);
+        }
+
+        if (rd0_state == 1 && env_state != ENV_IDLE && env_state != ENV_RELEASE) {
+            note_off();
+        }
+    }
+}
+
+void __interrupt() ISR(void){
+    
+    uint16_t sample_val = 0;
+    uint16_t dac_output = 0; //volume
+    
+    if (PIR1bits.TMR2IF){
+        PIR1bits.TMR2IF = 0;    //Clear tmr2 interrupt flag
+        //DDS step 1: advance phase by phase increment
+        lfo_phase_accum += lfo_phase_incr;
+        phase_accum += phase_incr;
+
+        //DDS step 2: assign wave sample value
+        uint8_t sine_index;
+        uint16_t sample_val;
+
+        switch (wave_type_index){
+            case SINE_WAVE: 
+                sine_index = (uint8_t)(phase_accum >> PHASE_SHIFT);
+                sample_val = sine_table[sine_index];
+                break;
+
+            case SQUARE_WAVE:
+                sample_val = (phase_accum & 0x80000000) ? 4095 : 0;
+                break;
+
+            case SAWTOOTH_WAVE: 
+                sample_val = phase_accum >> 20;
+                break;
+
+            case TRIANGLE_WAVE:
+                if (phase_accum & 0x80000000) {
+                    sample_val = 4095 - ((phase_accum >> 19) & 0x0FFF);
+                } else {
+                    sample_val = (phase_accum >> 19) & 0x0FFF;
+                }
+                break;
+
+            default:
+                sine_index = (uint8_t)(phase_accum >> PHASE_SHIFT);
+                sample_val = sine_table[sine_index];
+                break;
+        }
+        
+        // *** VOLUME CHANGE ***
+        // OPTIMIZED: compute tremolo gain once using the LFO phase.
+        // This avoids a function call and avoids reading the LFO table twice.
+        uint8_t lfo_index = (uint8_t)(lfo_phase_accum >> PHASE_SHIFT);
+        int8_t lfo_signed = lfo_sine_table[lfo_index];     // -127 to +127
+
+        // convert -127..+127 into 0..254-ish
+        uint16_t lfo_0_255 = (uint16_t)((int16_t)lfo_signed + 127);
+
+        // trem_gain = 255 when depth = 0
+        // deeper tremolo follows the LFO more strongly
+        uint16_t trem_gain = 255 - (((uint16_t)tremolo_depth * (255 - lfo_0_255)) >> 8);
+
+        uint16_t env_trem_gain = ((uint16_t)env_level * trem_gain) >> 8;
+        uint16_t total_gain = ((uint16_t)volume * env_trem_gain) >> 8;
+
+        // Only one final audio multiply.
+        int32_t centered = (int32_t)sample_val - 2048;
+        int32_t final_vol = (centered * total_gain) >> 8;
+
+        dac_output = (uint16_t)(2048 + final_vol);
+        
+        //DDS step 3: send sample to DAC
+        mcp4822_write(DAC_CHAN_A, GAIN_1X, dac_output);
+    }
+    //==============================================
+    //TRM0 slower stuff
+    if (INTCONbits.TMR0IF) {
+        INTCONbits.TMR0IF = 0;
+
+        // Reload for next 1 ms
+        TMR0H = 0xFE;
+        TMR0L = 0x0C;
+
+        // Set flag ONLY (keep ISR fast)
+        control_tick_flag = 1;
+        env_tick_flag = 1;
+        
+        uint8_t raw;
+
+        // ---------- RC0 ----------
+        raw = PORTCbits.RC0;
+
+        if (raw == rc0_last) {                      //if current input matches previous input (hold or released)
+            if (rc0_cnt < DEBOUNCE_MS) rc0_cnt++;   //then if counter less than 20ms, increment (detect hold for 20ms)
+            else if (rc0_state != raw) {            //then if current state var does not equal current input,
+                rc0_state = raw;                    //update current state
+                if (rc0_state == 0) rc0_event = 1;  //if current state is button press, event happens
+            }       //so: if button held for 20ms, set event equal to 1, and don't update cuz state = current input
+        } else {            //otherwise
+            rc0_cnt = 0;    //reset counter
+            rc0_last = raw; //update previous input with current input
+        }
+
+        // ---------- RC1 ----------
+        raw = PORTCbits.RC1;
+
+        if (raw == rc1_last) {
+            if (rc1_cnt < DEBOUNCE_MS) rc1_cnt++;
+            else if (rc1_state != raw) {
+                rc1_state = raw;
+                if (rc1_state == 0) rc1_event = 1;
+            }
+        } else {
+            rc1_cnt = 0;
+            rc1_last = raw;
+        }
+
+        // ---------- RD0 ----------
+        raw = PORTDbits.RD0;
+
+        if (raw == rd0_last) {
+            if (rd0_cnt < DEBOUNCE_MS) rd0_cnt++;
+            else if (rd0_state != raw) {
+                rd0_state = raw;
+                if (rd0_state == 0) rd0_event = 1;
+            }
+        } else {
+            rd0_cnt = 0;
+            rd0_last = raw;
+        }
+    }
+}

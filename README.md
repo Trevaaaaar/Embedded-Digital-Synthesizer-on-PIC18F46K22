@@ -114,7 +114,7 @@ The synthesizer was tested and documented incrementally by verifying various har
 | 18 | Final integrated system test | Verified real-time audio output with LCD control, calibrated ADC input, ADSR, tremolo, pitch selection, and EEPROM-backed presets working together. |
 
 ## Synth Demo
-[Synth demo](https://youtu.be/fl0WAikmBqc)
+![Synth demo video](https://youtu.be/fl0WAikmBqc)
 
 ## Future Improvements
 - Add polyphonic note support

@@ -113,6 +113,9 @@ The synthesizer was tested and documented incrementally by verifying various har
 | 17 | ADC calibration | Remapped measured potentiometer ADC limits to the full software range so endpoints like 0%, 100%, C4, and C5 were reachable. |
 | 18 | Final integrated system test | Verified real-time audio output with LCD control, calibrated ADC input, ADSR, tremolo, pitch selection, and EEPROM-backed presets working together. |
 
+## Synth Demo
+[Synth demo](https://youtu.be/fl0WAikmBqc)
+
 ## Future Improvements
 - Add polyphonic note support
 - Implement 12-button matrix as a piano-like input interface
